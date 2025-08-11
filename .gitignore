@@ -28,6 +28,8 @@ Sources/
 
 # Log files
 *.log
+*.bin
+*.mil
 
 # VSCodium / VS Code editor specific
 .vscode/
