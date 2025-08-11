@@ -3,6 +3,7 @@ import Vision
 import CoreML
 import AppKit
 import Security
+import LocalAuthentication
 
 // --- Global Logger ---
 class Logger {
@@ -15,42 +16,31 @@ class Logger {
     static func log(_ message: String) {
         let timestamp = dateFormatter.string(from: Date())
         print("[\(timestamp)] \(message)")
-        fflush(stdout)
+        fflush(stdout)  // Force immediate output
     }
 }
 
-// --- Keychain Access ---
+// --- Keychain Access (Fixed to avoid password prompts) ---
 func getPasswordFromKeychain(service: String, account: String) -> String? {
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
         kSecAttrAccount as String: account,
         kSecReturnData as String: kCFBooleanTrue!,
-        kSecMatchLimit as String: kSecMatchLimitOne
+        kSecMatchLimit as String: kSecMatchLimitOne,
+        kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip  // Skip UI prompts
     ]
     var item: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &item)
     guard status == errSecSuccess, let data = item as? Data else {
         Logger.log("Keychain access error: Status code \(status)")
+        if status == -128 || status == -25293 {  // errSecUserCancel or errSecAuthFailed
+            Logger.log("Keychain access requires user interaction. Please run: security unlock-keychain")
+        }
         return nil
     }
     return String(data: data, encoding: .utf8)
 }
-
-// --- Utility: Find Executable ---
-func findExecutable(named name: String) -> String? {
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-    task.arguments = [name]
-    let pipe = Pipe()
-    task.standardOutput = pipe
-    try? task.run()
-    task.waitUntilExit()
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-    return path?.isEmpty == false ? path : nil
-}
-
 
 // --- Configuration Loader ---
 struct AppConfig {
@@ -60,7 +50,7 @@ struct AppConfig {
     let confidenceThreshold: Float
     let snapshotOnDetection: Bool
     let notificationCooldown: TimeInterval
-    let debugTakeSnapshot: Bool
+    let testCaptureOnStart: Bool
 
     init?() {
         Logger.log("Loading configuration from config.env...")
@@ -79,7 +69,9 @@ struct AppConfig {
             if line.starts(with: "#") || line.isEmpty { continue }
             let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
             if parts.count == 2 {
-                configDict[parts[0].trimmingCharacters(in: .whitespaces)] = parts[1].trimmingCharacters(in: .init(charactersIn: "\" "))
+                let key = parts[0].trimmingCharacters(in: .whitespaces)
+                let value = parts[1].trimmingCharacters(in: .init(charactersIn: "\" "))
+                configDict[key] = value
             }
         }
 
@@ -104,26 +96,23 @@ struct AppConfig {
         
         Logger.log("Successfully retrieved credentials for user '\(username)' from Keychain.")
         
-        guard var components = URLComponents(string: urlTemplate) else {
-            Logger.log("Error: The RTSP_FEED_URL '\(urlTemplate)' is not a valid URL.")
-            return nil
-        }
-        components.user = username
-        components.password = password
-        
-        guard let finalURL = components.url?.absoluteString else {
-            Logger.log("Error: Failed to construct final authenticated RTSP URL.")
-            return nil
-        }
-        self.finalRTSP_URL = finalURL
+        // FIXED: Manual URL construction for Reolink cameras
+        // Replace rtsp:// with rtsp://username:password@
+        let authenticatedURL = urlTemplate.replacingOccurrences(of: "rtsp://", with: "rtsp://\(username):\(password)@")
+        self.finalRTSP_URL = authenticatedURL
         Logger.log("RTSP URL constructed successfully.")
+        
+        // Show sanitized URL for logging
+        if let parsedURL = URL(string: authenticatedURL) {
+            Logger.log("Final URL format: rtsp://\(username):***@\(parsedURL.host ?? "unknown"):\(parsedURL.port ?? 554)\(parsedURL.path)")
+        }
 
         self.saveDirectory = URL(fileURLWithPath: configDict["SNAPSHOT_DIRECTORY"] ?? "Captures")
         self.targetObjects = (configDict["OBJECTS_TO_MONITOR"] ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
         self.confidenceThreshold = Float(configDict["DETECTION_THRESHOLD"] ?? "0.4") ?? 0.4
         self.snapshotOnDetection = (configDict["SNAPSHOT_ON_DETECTION"] ?? "true").lowercased() == "true"
         self.notificationCooldown = TimeInterval(configDict["NOTIFICATION_COOLDOWN"] ?? "10") ?? 10
-        self.debugTakeSnapshot = (configDict["DEBUG_TAKE_SNAPSHOT"] ?? "false").lowercased() == "true"
+        self.testCaptureOnStart = (configDict["TEST_CAPTURE_ON_START"] ?? "true").lowercased() == "true"
     }
 }
 
@@ -154,15 +143,23 @@ class AIModelManager {
 
     func performDetection(on buffer: CVImageBuffer, block: @escaping ([(label: String, confidence: Float, box: CGRect)]) -> Void) {
         let request = VNCoreMLRequest(model: model) { (request, error) in
-            if let error = error { Logger.log("Vision request error: \(error.localizedDescription)"); block([]); return }
-            guard let results = request.results as? [VNRecognizedObjectObservation] else { block([]); return }
-            block(results.map { ($0.labels.first?.identifier ?? "unknown", $0.confidence, $0.boundingBox) })
+            if let error = error {
+                Logger.log("Vision request error: \(error.localizedDescription)")
+                block([])
+                return
+            }
+            guard let results = request.results as? [VNRecognizedObjectObservation] else {
+                block([])
+                return
+            }
+            let detections = results.map { ($0.labels.first?.identifier ?? "unknown", $0.confidence, $0.boundingBox) }
+            block(detections)
         }
         try? VNImageRequestHandler(cvPixelBuffer: buffer, options: [:]).perform([request])
     }
 }
 
-// --- RTSP Stream Reader with Failsafe ---
+// --- RTSP Stream Reader (Simplified and Fixed) ---
 class RTSPStreamReader {
     private var process: Process?
     private let rtspURL: String
@@ -173,6 +170,19 @@ class RTSPStreamReader {
     init(rtspURL: String, onFrameData: @escaping (Data) -> Void) {
         self.rtspURL = rtspURL
         self.onFrameData = onFrameData
+    }
+    
+    private func findExecutable(named name: String) -> String? {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        task.arguments = [name]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        try? task.run()
+        task.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return path?.isEmpty == false ? path : nil
     }
 
     func start() {
@@ -192,30 +202,63 @@ class RTSPStreamReader {
         let stdErrPipe = Pipe()
         process = Process()
         process?.executableURL = URL(fileURLWithPath: ffmpegPath)
+        
+        // FIXED: Use simple ffmpeg arguments that work with Reolink
         process?.arguments = [
-            "-v", "verbose",
-            "-i", rtspURL,
-            "-pix_fmt", "bgr24",
-            "-f", "rawvideo",
-            "-an",
-            "-"
+            "-rtsp_transport", "tcp",       // Use TCP transport (matches your working command)
+            "-i", rtspURL,                  // Input URL
+            "-f", "rawvideo",              // Output raw video
+            "-pix_fmt", "bgr24",           // Pixel format
+            "-an",                         // No audio
+            "-r", "1",                     // Limit to 1 fps for debugging
+            "-"                            // Output to stdout
         ]
         
         let stdOutPipe = Pipe()
         process?.standardOutput = stdOutPipe
         process?.standardError = stdErrPipe
         
-        stdOutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in self?.onFrameData(handle.availableData) }
+        stdOutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if !data.isEmpty {
+                Logger.log("Received \(data.count) bytes from ffmpeg stdout")
+                self?.onFrameData(data)
+            }
+        }
         
+        // IMPROVED: Better error parsing and logging
         stdErrPipe.fileHandleForReading.readabilityHandler = { handle in
-            if let errorString = String(data: handle.availableData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !errorString.isEmpty {
-                 Logger.log("ffmpeg: \(errorString)")
+            if let errorString = String(data: handle.availableData, encoding: .utf8), !errorString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let cleanError = errorString.trimmingCharacters(in: .whitespacesAndNewlines)
+                
+                // Parse important connection errors
+                if cleanError.contains("Connection refused") {
+                    Logger.log("CONNECTION ERROR: Camera refused connection. Check IP address and port.")
+                } else if cleanError.contains("401") || cleanError.contains("Unauthorized") {
+                    Logger.log("AUTH ERROR: Invalid credentials. Check username/password in Keychain.")
+                } else if cleanError.contains("timed out") || cleanError.contains("timeout") {
+                    Logger.log("TIMEOUT ERROR: Connection timed out. Check network connectivity.")
+                } else if cleanError.contains("No route to host") {
+                    Logger.log("NETWORK ERROR: Cannot reach camera IP address.")
+                } else if cleanError.contains("Stream") && cleanError.contains("fps") {
+                    Logger.log("STREAM INFO: \(cleanError)")
+                } else if cleanError.contains("Input #0") {
+                    Logger.log("STREAM CONNECTED: \(cleanError)")
+                } else if !cleanError.contains("ffmpeg version") && !cleanError.contains("libav") && !cleanError.contains("configuration:") {
+                    Logger.log("ffmpeg: \(cleanError)")
+                }
             }
         }
         
         process?.terminationHandler = { [weak self] process in
             guard let self = self, !self.isRestarting else { return }
-            Logger.log("Error: ffmpeg process terminated unexpectedly (Code: \(process.terminationStatus)).")
+            let exitCode = process.terminationStatus
+            if exitCode != 0 {
+                Logger.log("ERROR: ffmpeg process terminated with exit code \(exitCode)")
+                if exitCode == 1 {
+                    Logger.log("This usually indicates a connection or authentication problem.")
+                }
+            }
             self.isRestarting = true
             Logger.log("Stream connection lost. Attempting to reconnect in 15 seconds...")
             DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
@@ -239,44 +282,51 @@ class RTSPStreamReader {
     }
 }
 
-// --- Main Application ---
+// --- Main Application (Simplified) ---
 class Application {
-    let config: AppConfig
+    private let config: AppConfig
     private let modelManager: AIModelManager
     private var frameDataBuffer = Data()
     private var hasReceivedFrame = false
-    private let frameWidth: Int
-    private let frameHeight: Int
+    private let frameWidth = 1920  // Standard HD resolution
+    private let frameHeight = 1080
     private var lastSnapshotTime = Date(timeIntervalSince1970: 0)
     private var frameCount = 0
     private var lastHeartbeat = Date()
     
     private lazy var streamReader: RTSPStreamReader = {
-        return RTSPStreamReader(rtspURL: self.config.finalRTSP_URL, onFrameData: { [weak self] data in self?.processFrameData(data) })
+        return RTSPStreamReader(rtspURL: self.config.finalRTSP_URL, onFrameData: { [weak self] data in
+            self?.processFrameData(data)
+        })
     }()
 
     init?() {
         Logger.log("Initializing AI Cam Monitor application...")
         
-        guard let config = AppConfig() else { Logger.log("Failed to load configuration."); return nil }
+        guard let config = AppConfig() else { 
+            Logger.log("Failed to load configuration.")
+            return nil 
+        }
         self.config = config
         
-        if config.debugTakeSnapshot {
-            Application.runDebugSnapshot(config: config)
-            return nil
+        // Test stream connectivity with a simple capture before starting monitoring
+        if config.testCaptureOnStart {
+            Logger.log("Running initial stream connectivity test...")
+            if !Self.testStreamConnectivity(config: config) {
+                Logger.log("Stream connectivity test failed. Please check your camera connection.")
+                return nil
+            }
         }
         
-        guard let resolution = Application.runStreamProbe(config: config) else { Logger.log("Stream probe failed. Aborting startup."); return nil }
-        
-        guard let modelManager = AIModelManager() else { Logger.log("Failed to initialize AI model."); return nil }
-
+        guard let modelManager = AIModelManager() else { 
+            Logger.log("Failed to initialize AI model.")
+            return nil 
+        }
         self.modelManager = modelManager
-        self.frameWidth = resolution.width
-        self.frameHeight = resolution.height
         
         Logger.log("Creating snapshot directory: \(config.saveDirectory.path)")
         do {
-            try FileManager.default.createDirectory(at: config.saveDirectory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: config.saveDirectory, withIntermediateDirectories: true, attributes: nil)
             Logger.log("Snapshot directory ready.")
         } catch {
             Logger.log("Warning: Could not create snapshot directory: \(error)")
@@ -285,126 +335,34 @@ class Application {
         Logger.log("Application initialization completed successfully.")
     }
 
-    private static func runStreamProbe(config: AppConfig) -> (width: Int, height: Int)? {
-        Logger.log("--- Starting Stream Pre-flight Check ---")
-        guard let ffprobePath = findExecutable(named: "ffprobe") else {
-            Logger.log("FATAL: 'ffprobe' not found. Please reinstall via Homebrew or run ./install.sh")
-            return nil
-        }
-        Logger.log("Probing stream with ffprobe at \(ffprobePath)...")
-        
-        let process = Process()
-        let pipe = Pipe()
-        let errorPipe = Pipe()
-
-        process.executableURL = URL(fileURLWithPath: ffprobePath)
-        process.arguments = [
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=p=0",
-            "-timeout", "5000000",
-            config.finalRTSP_URL
-        ]
-        process.standardOutput = pipe
-        process.standardError = errorPipe
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            if let errorOutput = String(data: errorData, encoding: .utf8), !errorOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Logger.log("Stream Probe Error: \(errorOutput.trimmingCharacters(in: .whitespacesAndNewlines))")
-                Logger.log("Please check your RTSP_FEED_URL, credentials in Keychain, and network connection.")
-                return nil
-            }
-            
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-
-            if let res = output, !res.isEmpty, res.contains(",") {
-                Logger.log("Stream Probe Success! Detected resolution: \(res)")
-                Logger.log("--- Stream Pre-flight Check Passed ---")
-                let parts = res.split(separator: ",").compactMap { Int($0) }
-                if parts.count == 2 {
-                    return (width: parts[0], height: parts[1])
-                }
-            }
-            
-            Logger.log("Stream Probe Failed: Could not get stream information. The URL may be incorrect or the camera unreachable.")
-            return nil
-            
-        } catch {
-            Logger.log("Stream Probe Failed: Could not run ffprobe process. Error: \(error)")
-            return nil
-        }
-    }
-
-    private static func runDebugSnapshot(config: AppConfig) {
-        Logger.log("--- Running in Debug Snapshot Mode ---")
-        guard let ffmpegPath = findExecutable(named: "ffmpeg") else {
-            Logger.log("FATAL: 'ffmpeg' not found.")
-            return
-        }
-
-        let timestamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-        let saveURL = config.saveDirectory.appendingPathComponent("debug_snapshot_\(timestamp).jpg")
-
-        let process = Process()
-        let errorPipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: ffmpegPath)
-        process.arguments = [
-            "-i", config.finalRTSP_URL,
-            "-vframes", "1",
-            "-q:v", "2",
-            saveURL.path
-        ]
-        process.standardError = errorPipe
-        
-        Logger.log("Executing command: \(ffmpegPath) \(process.arguments!.joined(separator: " "))")
-
-        do {
-            try process.run()
-            
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            if let errorOutput = String(data: errorData, encoding: .utf8), !errorOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Logger.log("ffmpeg Debug Output:\n--- START ---\n\(errorOutput.trimmingCharacters(in: .whitespacesAndNewlines))\n--- END ---")
-            }
-            
-            process.waitUntilExit()
-            
-            if process.terminationStatus == 0 {
-                Logger.log("Debug snapshot saved successfully to: \(saveURL.path)")
-            } else {
-                Logger.log("Debug snapshot failed. Check ffmpeg output above for errors.")
-            }
-        } catch {
-            Logger.log("Error: Failed to run ffmpeg for debug snapshot: \(error)")
-        }
-    }
-
-
     func run() {
         Logger.log("AI Cam Monitor starting up...")
         Logger.log("========================================")
+        // Show sanitized URL for logging
         if let url = URL(string: config.finalRTSP_URL) {
-            let sanitizedURL = "rtsp://\(url.host ?? "unknown")\(url.path)"
-            Logger.log("Monitoring URL: \(sanitizedURL)")
+            Logger.log("Monitoring URL: rtsp://\(url.host ?? "unknown"):\(url.port ?? 554)\(url.path)")
         }
         Logger.log("Target Objects: \(config.targetObjects.isEmpty ? "any" : config.targetObjects.joined(separator: ", "))")
         Logger.log("Confidence Threshold: \(Int(config.confidenceThreshold * 100))%")
         Logger.log("Save Snapshots: \(config.snapshotOnDetection)")
         Logger.log("Notification Cooldown: \(config.notificationCooldown) seconds")
+        Logger.log("Test Capture On Start: \(config.testCaptureOnStart)")
         Logger.log("Snapshot Directory: \(config.saveDirectory.path)")
         Logger.log("========================================")
 
         streamReader.start()
         
+        // Heartbeat timer to show the app is alive
         Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            if self.hasReceivedFrame { Logger.log("Heartbeat: Application running normally. Frames processed: \(self.frameCount)") } 
-            else { Logger.log("Heartbeat: Waiting for video stream connection...") }
+            let now = Date()
+            if self.hasReceivedFrame {
+                Logger.log("Heartbeat: Application running normally. Frames processed: \(self.frameCount)")
+            } else {
+                let elapsed = Int(now.timeIntervalSince(self.lastHeartbeat))
+                Logger.log("Heartbeat: Waiting for video stream connection... (\(elapsed)s elapsed)")
+            }
+            self.lastHeartbeat = now
         }
         
         Logger.log("Application is now running. Press Ctrl+C to stop.")
@@ -414,25 +372,39 @@ class Application {
     private func processFrameData(_ data: Data) {
         if !hasReceivedFrame {
             Logger.log("SUCCESS: Video stream connected! Receiving frame data from camera.")
+            Logger.log("Frame data size: \(data.count) bytes")
             hasReceivedFrame = true
         }
         
-        Logger.log("Received \(data.count) bytes from stream.")
         frameDataBuffer.append(data)
         let frameSize = frameWidth * frameHeight * 3
+        Logger.log("Buffer size: \(frameDataBuffer.count) bytes, Frame size needed: \(frameSize) bytes")
         
         while frameDataBuffer.count >= frameSize {
             let frameData = frameDataBuffer.prefix(frameSize)
             frameDataBuffer.removeFirst(frameSize)
-            frameCount += 1
             
-            if frameCount % 100 == 0 { Logger.log("Processing: Frame #\(frameCount) received and analyzed.") }
-            guard let frameBuffer = createPixelBuffer(from: frameData, width: frameWidth, height: frameHeight) else { continue }
+            frameCount += 1
+            Logger.log("Processing frame #\(frameCount)")
+            
+            // Log every 10 frames during initial testing
+            if frameCount <= 10 || frameCount % 100 == 0 {
+                Logger.log("Processing: Frame #\(frameCount) received and analyzed.")
+            }
+            
+            guard let frameBuffer = createPixelBuffer(from: frameData, width: frameWidth, height: frameHeight) else { 
+                Logger.log("Warning: Failed to create pixel buffer for frame #\(frameCount)")
+                continue 
+            }
             
             modelManager.performDetection(on: frameBuffer) { [weak self] detections in
                 guard let self = self else { return }
-                let filtered = detections.filter { ($0.label != "unknown") && ($0.confidence >= self.config.confidenceThreshold) && (self.config.targetObjects.isEmpty || self.config.targetObjects.contains($0.label)) }
-                if !filtered.isEmpty { self.handleDetection(detections: filtered, frame: frameBuffer) }
+                let filteredDetections = detections.filter {
+                    ($0.label != "unknown") && ($0.confidence >= self.config.confidenceThreshold) && (self.config.targetObjects.isEmpty || self.config.targetObjects.contains($0.label))
+                }
+                if !filteredDetections.isEmpty {
+                    self.handleDetection(detections: filteredDetections, frame: frameBuffer)
+                }
             }
         }
     }
@@ -443,7 +415,7 @@ class Application {
         lastSnapshotTime = now
         
         let labels = detections.map { "\($0.label) (\(Int($0.confidence * 100))%)" }.joined(separator: ", ")
-        Logger.log("Detection: \(labels) at frame #\(frameCount)")
+        Logger.log("🎯 DETECTION: \(labels) at frame #\(frameCount)")
 
         if config.snapshotOnDetection {
             let formatter = ISO8601DateFormatter()
@@ -460,8 +432,8 @@ class Application {
         var pixelBuffer: CVPixelBuffer?
         var mutableData = data
         let status = mutableData.withUnsafeMutableBytes { (bytes: UnsafeMutableRawBufferPointer) -> CVReturn in
-            let options: [String: Any] = [kCVPixelBufferCGImageCompatibilityKey as String: true, kCVPixelBufferCGBitmapContextCompatibilityKey as String: true]
-            return CVPixelBufferCreateWithBytes(kCFAllocatorDefault, width, height, kCVPixelFormatType_24BGR, bytes.baseAddress!, width * 3, nil, nil, options as CFDictionary, &pixelBuffer)
+            let options = [kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue!, kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue!] as CFDictionary
+            return CVPixelBufferCreateWithBytes(kCFAllocatorDefault, width, height, kCVPixelFormatType_24BGR, bytes.baseAddress!, width * 3, nil, nil, options, &pixelBuffer)
         }
         return status == kCVReturnSuccess ? pixelBuffer : nil
     }
@@ -471,20 +443,22 @@ class Application {
         let context = CIContext()
         guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent),
               let destination = CGImageDestinationCreateWithURL(url as CFURL, "public.jpeg" as CFString, 1, nil) else {
-            Logger.log("Error: Failed to create image for saving."); return
+            Logger.log("Error: Failed to create image for saving.")
+            return
         }
         CGImageDestinationAddImage(destination, cgImage, nil)
-        if !CGImageDestinationFinalize(destination) { Logger.log("Error: Failed to save image to \(url.path)") } 
-        else { Logger.log("Snapshot saved: \(url.lastPathComponent)") }
+        if !CGImageDestinationFinalize(destination) {
+            Logger.log("Error: Failed to save image to \(url.path)")
+        } else {
+            Logger.log("📸 Snapshot saved: \(url.lastPathComponent)")
+        }
     }
 }
 
 // --- Entry Point ---
 Logger.log("Starting AI Cam Monitor...")
 guard let app = Application() else {
-    Logger.log("FATAL: Application failed to initialize. Review logs for details.")
+    Logger.log("FATAL: Application failed to initialize. Check config.env and model files.")
     exit(1)
 }
-if app.config.debugTakeSnapshot == false {
-    app.run()
-}
+app.run()
