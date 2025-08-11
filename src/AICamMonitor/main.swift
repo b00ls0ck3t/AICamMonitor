@@ -113,9 +113,8 @@ class AIModelManager {
     private let model: VNCoreMLModel
 
     init?() {
-        let modelURL = URL(fileURLWithPath: #file).deletingLastPathComponent().appendingPathComponent("Resources/yolov8n.mlmodelc")
-        guard FileManager.default.fileExists(atPath: modelURL.path) else {
-            Logger.log("Error: Compiled model 'yolov8n.mlmodelc' not found at \(modelURL.path). Please run ./install.sh")
+        guard let modelURL = Bundle.main.url(forResource: "yolov8n", withExtension: "mlmodelc") else {
+            Logger.log("Error: Compiled model 'yolov8n.mlmodelc' not found in bundle resources. Please run ./install.sh")
             return nil
         }
         do {
