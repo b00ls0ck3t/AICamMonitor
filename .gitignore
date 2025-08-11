@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build artifacts and logs
+*.log
+.build/
+aicam_service.log
+aicam_service_error.log
+
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Swift
+*.xcodeproj
+xcuserdata/
+
+# VSCodium / VS Code
+.vscode/
+
+# Sensitive configuration
+config.env
