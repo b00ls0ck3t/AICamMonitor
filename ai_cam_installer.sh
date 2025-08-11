@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # AI Cam Monitor - Interactive Installer & Configurator
-# Final version with verbose error logging and correct Reolink URL construction.
+# Professional version with enhanced logging, local venv, and gitignore.
 
 set -euo pipefail
 
 # --- Configuration ---
 INSTALL_DIR="$HOME/AICamMonitor"
 CONFIG_FILE="$INSTALL_DIR/config.env"
-VENV_DIR=".venv"
+VENV_DIR="$INSTALL_DIR/.venv" # Correctly located inside the project
 PROJECT_NAME="AICamMonitor"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="$INSTALL_DIR/installer_${TIMESTAMP}.log"
@@ -23,20 +23,6 @@ CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 NC='\033[0m' # No Color
 
-CHECK="✅"
-CROSS="❌"
-ROCKET="🚀"
-GEAR="⚙️"
-CAMERA="📹"
-BRAIN="🧠"
-BELL="🔔"
-LOCK="🔒"
-CLEAN="🧹"
-
-# Ensure the installation directory exists and move into it
-mkdir -p "$INSTALL_DIR"
-cd "$INSTALL_DIR"
-
 # --- Functions ---
 
 log() {
@@ -50,9 +36,9 @@ log_header() {
 }
 
 log_info() { log "${BLUE}[INFO]${NC} $1"; }
-log_success() { log "${GREEN}[SUCCESS]${NC} $CHECK $1"; }
-log_warning() { log "${YELLOW}[WARNING]${NC} ⚠️  $1"; }
-log_error() { log "${RED}[ERROR]${NC} $CROSS $1"; }
+log_success() { log "${GREEN}[SUCCESS]${NC} $1"; }
+log_warning() { log "${YELLOW}[WARNING]${NC} $1"; }
+log_error() { log "${RED}[ERROR]${NC} $1"; }
 
 show_banner() {
     clear
@@ -150,14 +136,31 @@ check_prerequisites() {
     log_success "Xcode Command Line Tools installed."
 }
 
-show_cleanup_instructions() {
-    log_header "${CLEAN} Global Python Cleanup"
-    echo -e "${YELLOW}If previous script versions were run, Python packages may exist globally.${NC}"
-    echo -e "${WHITE}It's safer to remove these manually. This script will use its own private environment.${NC}\n"
-    if ! prompt_yes_no "Have you reviewed this and wish to continue with the installation?" "y"; then
-        echo -e "${YELLOW}Installation cancelled.${NC}"
-        exit 0
+create_gitignore() {
+    log_header "GITIGNORE SETUP"
+    if [ -f ".gitignore" ]; then
+        log_success ".gitignore already exists."
+        return
     fi
+    cat > "$INSTALL_DIR/.gitignore" << EOF
+# macOS
+.DS_Store
+
+# Swift
+.build/
+*.xcodeproj
+xcuserdata/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Logs and sensitive info
+*.log
+config.env
+EOF
+    log_success "Created .gitignore file."
 }
 
 collect_configuration() {
@@ -165,9 +168,15 @@ collect_configuration() {
     : "${RTSP_FEED_URL:=rtsp://10.0.60.130:554/h264Preview_01_main}"
     : "${CAM_USERNAME:=admin}"
     : "${OBJECTS_TO_MONITOR:=person,car}"
-    # ... other defaults
+    : "${DETECTION_THRESHOLD:=0.7}"
+    : "${YOLO_VARIANT:=n}"
+    : "${NOTIFICATION_COOLDOWN:=300}"
+    : "${SNAPSHOT_ON_DETECTION:=true}"
+    : "${SNAPSHOT_DIRECTORY:=$HOME/Desktop/CameraSnapshots}"
+    : "${PROCESSING_FPS:=10}"
+    : "${MAX_DETECTIONS:=20}"
     
-    prompt_user "Enter FULL camera RTSP URL (e.g., rtsp://10.0.60.130:554/h264Preview_01_main)" "RTSP_FEED_URL"
+    prompt_user "Enter FULL camera RTSP URL" "RTSP_FEED_URL"
     prompt_user "Enter camera username" "CAM_USERNAME"
     prompt_password "Enter camera password" "CAM_PASSWORD"
 
@@ -177,7 +186,26 @@ collect_configuration() {
         printf "\033[1A\033[K"
     fi
     
-    # ... rest of configuration prompts
+    echo -e "\nAI Detection Settings"
+    prompt_user "Objects to monitor (comma-separated)" "OBJECTS_TO_MONITOR"
+    prompt_user "Detection confidence threshold (0.1-0.9)" "DETECTION_THRESHOLD"
+    
+    echo -e "\nNotification Settings"
+    prompt_user "Cooldown between notifications (seconds)" "NOTIFICATION_COOLDOWN"
+
+    echo -e "\nSnapshot Settings"
+    if prompt_yes_no "Save snapshots when objects are detected?" "y"; then
+        SNAPSHOT_ON_DETECTION="true"
+        prompt_user "Snapshot directory" "SNAPSHOT_DIRECTORY"
+    else
+        SNAPSHOT_ON_DETECTION="false"
+    fi
+
+    echo -e "\nAdvanced Settings"
+    prompt_user "Frame processing rate (FPS)" "PROCESSING_FPS"
+    prompt_user "YOLO model variant (n/s/m/l/x - 'n' is fastest)" "YOLO_VARIANT"
+    prompt_user "Maximum detections per frame" "MAX_DETECTIONS"
+
     save_config
 }
 
@@ -186,25 +214,23 @@ test_rtsp_connection() {
     local username="$2"
     local password="$3"
     
-    # *** THIS IS THE FIX ***
-    # This sed command finds "rtsp://" and replaces it with "rtsp://user:pass@",
-    # correctly constructing the URL you need.
     local full_auth_url=$(echo "$url" | sed "s|rtsp://|rtsp://$username:$password@|")
 
-    if ! command -v ffprobe >/dev/null 2>&1; then
-        log_warning "ffprobe not found. Skipping live camera connection test."
+    if ! command -v gtimeout >/dev/null 2>&1; then
+        log_warning "gtimeout (from coreutils) not found. Skipping live camera connection test."
+        log_info "The installer will add it, and the test will run on the next execution."
         return 0
     fi
 
     log_info "Testing connection to: $url (with credentials)"
-    # Execute ffprobe and capture its output (stdout and stderr) for detailed logging
-    if ffprobe_output=$(timeout 10 ffprobe -rtsp_transport tcp -select_streams v:0 "$full_auth_url" 2>&1); then
+    # *** THIS IS THE FIX: Use -v error to get specific failure reasons ***
+    if ffprobe_output=$(gtimeout 10 ffprobe -v error -rtsp_transport tcp "$full_auth_url" 2>&1); then
         log_success "Camera connection successful!"
         return 0
     else
         log_error "Could not connect to the camera stream."
         echo -e "${RED}--- FFprobe Error Details ---${NC}"
-        echo "$ffprobe_output" # Print the detailed error message
+        echo "$ffprobe_output"
         echo -e "${RED}---------------------------${NC}"
         if ! prompt_yes_no "Continue anyway?" "n"; then exit 1; fi
         return 1
@@ -215,11 +241,15 @@ install_dependencies() {
     log_header "DEPENDENCY INSTALLATION"
     if ! command -v brew >/dev/null 2>&1; then log_info "Installing Homebrew..."; /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; fi
     log_success "Homebrew is ready."
-    if ! brew list ffmpeg >/dev/null 2>&1; then log_info "Installing FFmpeg..."; brew install ffmpeg; fi
-    log_success "FFmpeg is ready."
-    log_info "Setting up Python virtual environment..."
+
+    log_info "Installing dependencies: ffmpeg and coreutils (for gtimeout)..."
+    brew install ffmpeg coreutils
+    log_success "Dependencies are ready."
+
+    log_info "Setting up Python virtual environment at '$VENV_DIR'..."
     if [ ! -d "$VENV_DIR" ]; then python3 -m venv "$VENV_DIR"; fi
     log_success "Virtual environment is ready."
+
     log_info "Installing Python packages..."
     source "$VENV_DIR/bin/activate"
     pip install --upgrade pip
@@ -264,8 +294,8 @@ download_and_convert_model() {
 
 create_swift_project_files() {
     log_header "CREATING PROJECT FILES"
-    mkdir -p "Sources/$PROJECT_NAME/Resources"
-    cat > Package.swift << EOF
+    mkdir -p "$INSTALL_DIR/Sources/$PROJECT_NAME/Resources"
+    cat > "$INSTALL_DIR/Package.swift" << EOF
 // swift-tools-version: 5.7
 import PackageDescription
 let package = Package(
@@ -274,7 +304,7 @@ let package = Package(
     targets: [ .executableTarget(name: "$PROJECT_NAME", resources: [.copy("Resources")]) ]
 )
 EOF
-    cat > "Sources/$PROJECT_NAME/main.swift" << 'EOF'
+    cat > "$INSTALL_DIR/Sources/$PROJECT_NAME/main.swift" << 'EOF'
 import Foundation
 // Placeholder for the main Swift application
 print("AI Cam Monitor starting...")
@@ -286,13 +316,14 @@ EOF
 build_and_create_runners() {
     log_header "BUILD AND CREATE RUNNERS"
     log_info "Building Swift application..."
+    cd "$INSTALL_DIR"
     if swift build -c release; then
         log_success "Build completed."
-        cat > run_monitor.sh << EOF
+        cat > "$INSTALL_DIR/run_monitor.sh" << EOF
 #!/bin/bash
 cd "\$(dirname "\$0")"
-echo "🚀 Starting AI Cam Monitor..."
-if [ ! -f config.env ]; then echo "❌ config.env not found!"; exit 1; fi
+echo "Starting AI Cam Monitor..."
+if [ ! -f config.env ]; then echo "ERROR: config.env not found!"; exit 1; fi
 export \$(grep -v '^#' config.env | xargs)
 if [ -z "\${CAM_PASSWORD:-}" ]; then
     echo "Please enter the camera password:"
@@ -303,7 +334,7 @@ export CAM_PASSWORD
 export FULL_AUTH_URL=\$(echo "\$RTSP_FEED_URL" | sed "s|rtsp://|rtsp://\$CAM_USERNAME:\$CAM_PASSWORD@|")
 .build/release/$PROJECT_NAME
 EOF
-        chmod +x run_monitor.sh
+        chmod +x "$INSTALL_DIR/run_monitor.sh"
         log_success "Created 'run_monitor.sh' to start the application."
     else
         log_error "Build failed."
@@ -313,11 +344,11 @@ EOF
 
 show_completion_summary() {
     log_header "INSTALLATION COMPLETE!"
-    echo -e "${WHITE}🎉 AI Cam Monitor installed in:${NC} $INSTALL_DIR"
-    echo -e "\n${WHITE}🚀 TO START:${NC}"
+    echo -e "${WHITE}AI Cam Monitor installed in:${NC} $INSTALL_DIR"
+    echo -e "\n${WHITE}TO START:${NC}"
     echo -e "   1. ${CYAN}cd $INSTALL_DIR${NC}"
     echo -e "   2. ${CYAN}./run_monitor.sh${NC}"
-    echo -e "\n${WHITE}💡 Your settings are saved in 'config.env'.${NC}"
+    echo -e "\n${WHITE}Your settings are saved in 'config.env'.${NC}"
 }
 
 # --- Main Execution ---
@@ -326,7 +357,7 @@ main() {
     show_banner
     load_config
     check_prerequisites
-    show_cleanup_instructions
+    create_gitignore
     install_dependencies
     collect_configuration
     test_rtsp_connection "$RTSP_FEED_URL" "$CAM_USERNAME" "$CAM_PASSWORD"
