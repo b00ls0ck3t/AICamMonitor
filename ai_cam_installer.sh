@@ -26,13 +26,14 @@ NC='\033[0m' # No Color
 # --- Functions ---
 
 log() {
+    # This function ensures all output goes to both the screen and the log file
     echo -e "$1" | tee -a "$LOG_FILE"
 }
 
 log_header() {
-    echo -e "\n${WHITE}================================${NC}" | tee -a "$LOG_FILE"
-    echo -e "${WHITE}$1${NC}" | tee -a "$LOG_FILE"
-    echo -e "${WHITE}================================${NC}\n" | tee -a "$LOG_FILE"
+    log "\n${WHITE}================================${NC}"
+    log "${WHITE}$1${NC}"
+    log "${WHITE}================================${NC}\n"
 }
 
 log_info() { log "${BLUE}[INFO]${NC} $1"; }
@@ -42,8 +43,9 @@ log_error() { log "${RED}[ERROR]${NC} $1"; }
 
 show_banner() {
     clear
-    echo -e "${PURPLE}"
-    cat << "EOF"
+    # Banner output should also be logged
+    echo -e "${PURPLE}" | tee -a "$LOG_FILE"
+    cat << "EOF" | tee -a "$LOG_FILE"
     ___    ____   ______                 __  ___            _ __
    /   |  /  _/  / ____/___ _____ ___   /  |/  /___  ____  (_) /_____  _____
   / /| |  / /   / /   / __ `/ __ `__ \ / /|_/ / __ \/ __ \/ / __/ __ \/ ___/
@@ -51,10 +53,10 @@ show_banner() {
 /_/  |_/___/   \____/\__,_/_/ /_/ /_//_/  /_/\____/_/ /_/_/\__/\____/_/
 
 EOF
-    echo -e "${NC}"
-    echo -e "${WHITE}AI-Powered Security Camera Monitoring for macOS${NC}"
-    echo -e "${CYAN}Local AI • Privacy First • Apple Silicon Optimized${NC}"
-    echo -e "${WHITE}════════════════════════════════════════════════════${NC}\n"
+    echo -e "${NC}" | tee -a "$LOG_FILE"
+    log "${WHITE}AI-Powered Security Camera Monitoring for macOS${NC}"
+    log "${CYAN}Local AI • Privacy First • Apple Silicon Optimized${NC}"
+    log "${WHITE}════════════════════════════════════════════════════${NC}\n"
 }
 
 # --- Configuration Management ---
@@ -222,16 +224,15 @@ test_rtsp_connection() {
         return 0
     fi
 
-    log_info "Testing connection to: $url (with credentials)"
-    # *** THIS IS THE FIX: Use -v error to get specific failure reasons ***
+    log_info "Attempting to connect to: $url"
     if ffprobe_output=$(gtimeout 10 ffprobe -v error -rtsp_transport tcp "$full_auth_url" 2>&1); then
         log_success "Camera connection successful!"
         return 0
     else
         log_error "Could not connect to the camera stream."
-        echo -e "${RED}--- FFprobe Error Details ---${NC}"
-        echo "$ffprobe_output"
-        echo -e "${RED}---------------------------${NC}"
+        log "${RED}--- FFprobe Error Details ---${NC}"
+        log "$ffprobe_output"
+        log "${RED}---------------------------${NC}"
         if ! prompt_yes_no "Continue anyway?" "n"; then exit 1; fi
         return 1
     fi
@@ -262,20 +263,32 @@ create_model_converter() {
     log_info "Creating model conversion script..."
     cat > convert_model.py << 'EOF'
 import sys, os
+import shutil
 from ultralytics import YOLO
+
 def convert(variant, out_path):
     try:
         model = YOLO(f"yolov8{variant}.pt")
-        model.export(format='coreml', imgsz=640, nms=True, half=True)
-        expected = f"yolov8{variant}.mlpackage"
-        if os.path.exists(expected):
-            import shutil
-            if os.path.exists(out_path): shutil.rmtree(out_path)
-            shutil.move(expected, out_path)
-            return True
-    except Exception as e: return False
+        # The export function returns the path to the exported model on success
+        exported_path = model.export(format='coreml', imgsz=640, nms=True, half=True)
+        print(f"Successfully exported model to: {exported_path}")
+        # The exported model is already at the correct final path (e.g., yolov8n.mlpackage)
+        # No move is necessary if we run from the correct directory.
+        return True # Return success
+    except Exception as e:
+        print(f"An error occurred during model conversion: {e}")
+        return False
+
 if __name__ == "__main__":
-    if not convert(sys.argv[1], sys.argv[2]): sys.exit(1)
+    if len(sys.argv) != 3:
+        print("Usage: python convert_model.py <variant> <output_path>")
+        sys.exit(1)
+    
+    variant = sys.argv[1]
+    output_path = sys.argv[2]
+    
+    if not convert(variant, output_path):
+        sys.exit(1)
 EOF
     chmod +x convert_model.py
 }
@@ -286,8 +299,11 @@ download_and_convert_model() {
     local coreml_model_name="yolov8${yolo_variant}.mlpackage"
     if [[ -d "$coreml_model_name" ]]; then log_success "AI Model already exists."; return; fi
     source "$VENV_DIR/bin/activate"
-    log_info "Downloading and converting YOLOv8 model..."
-    if ! python convert_model.py "$yolo_variant" "$coreml_model_name"; then log_error "Model conversion failed."; deactivate; exit 1; fi
+    log_info "Downloading and converting YOLOv8 model (output will be logged)..."
+    # *** FIX: Redirect python output to the log file while also showing it on screen ***
+    if ! python convert_model.py "$yolo_variant" "$coreml_model_name" 2>&1 | tee -a "$LOG_FILE"; then
+        log_error "Model conversion process failed. Check log for details."; deactivate; exit 1;
+    fi
     deactivate
     log_success "AI model ready."
 }
@@ -344,16 +360,18 @@ EOF
 
 show_completion_summary() {
     log_header "INSTALLATION COMPLETE!"
-    echo -e "${WHITE}AI Cam Monitor installed in:${NC} $INSTALL_DIR"
-    echo -e "\n${WHITE}TO START:${NC}"
-    echo -e "   1. ${CYAN}cd $INSTALL_DIR${NC}"
-    echo -e "   2. ${CYAN}./run_monitor.sh${NC}"
-    echo -e "\n${WHITE}Your settings are saved in 'config.env'.${NC}"
+    log_info "AI Cam Monitor has been successfully installed in: $INSTALL_DIR"
+    echo -e "\nTO START:"
+    echo -e "   1. cd $INSTALL_DIR"
+    echo -e "   2. ./run_monitor.sh"
+    echo -e "\nYour settings are saved in 'config.env'."
 }
 
 # --- Main Execution ---
 
 main() {
+    # Start with a clean log file for this run
+    > "$LOG_FILE"
     show_banner
     load_config
     check_prerequisites
