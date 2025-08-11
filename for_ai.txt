@@ -1,0 +1,64 @@
+AI Handoff & Project Brief: AICamMonitor
+1. Project Goal
+
+The user wants to create a fully functional, self-contained AI security camera monitoring application for macOS. The core of the project is an installer script (ai_cam_installer.sh) that automates the entire setup process, from installing dependencies to building and configuring the final Swift application.
+
+2. Prompting History & Key Debugging Steps
+
+The development process has been highly iterative and has involved fixing numerous bugs in the installer script. Key milestones and fixes include:
+
+Initial Scripting: Started with a non-functional script and incrementally fixed syntax errors, variable handling (unbound variable), and user input bugs (hidden password prompt).
+
+Camera Connection: This was the most significant challenge. We solved it by:
+
+Discovering the correct RTSP URL format for the user's Reolink camera.
+
+Fixing the script's logic to correctly construct the authenticated URL.
+
+Adding coreutils as a dependency to get the gtimeout command on macOS.
+
+Implementing verbose error logging from ffprobe to diagnose connection issues.
+
+Python & AI Model:
+
+Fixed a bug where the script incorrectly reported that the AI model conversion had failed.
+
+Ensured all Python-related tasks (dependency installation, model conversion) run inside a local .venv to avoid polluting the system's Python environment.
+
+Ensured all output from Python scripts is correctly logged.
+
+Project Structure & git:
+
+The user correctly identified that the project structure was messy and that generated files were being committed to git.
+
+We created a comprehensive .gitignore file to exclude build artifacts, logs, downloaded models (.pt, .mlpackage), and the local config.env file.
+
+We established that the installer script should not handle git operations; its sole focus is to build the application.
+
+3. Current Status & Immediate Next Steps
+
+The project is at a critical turning point. The installer script successfully handles all setup tasks, but the user has correctly identified two major remaining issues:
+
+Placeholder Application: The installer is still building a simple "Hello, World" style placeholder for the Swift application. The user has run this and confirmed it does nothing (no logs, no captures). The absolute top priority is to replace this placeholder with the final, functional, multi-file Swift application code.
+
+Messy Project Directory: The user wants a clean separation between source code and generated/build files. The current script leaves source files (.swift, Package.swift) mixed with configuration and run scripts in the root directory.
+
+4. Guidelines & Suggestions for the Next LLM
+
+Acknowledge and Validate: The user has been extremely patient and is a sharp developer. Acknowledge their valid criticisms (messy structure, placeholder code) and confirm that the next step will fix them.
+
+Provide the Complete, Functional Swift Code: The create_swift_project_files function in the installer script must be updated. It needs to create a src directory and populate it with the complete, working Swift application. This will involve using cat << EOF > to write several Swift files (main.swift, RTSPReader.swift, AIModelManager.swift, NotificationManager.swift, etc.). Do not use a placeholder.
+
+Implement the Clean Structure:
+
+Modify the installer to create a src/ directory for all Swift source files.
+
+Update the Package.swift file to correctly point to this new source directory.
+
+Add a cleanup function to the installer that removes the old, now-obsolete source files (ai_cam_swift_app.swift, etc.) from the project's root directory.
+
+Deliver via Canvas: Use a Canvas to provide the complete, final ai_cam_installer.sh script. Do not use patches or snippets.
+
+Maintain Professional Tone: The user has requested a clean, professional interface. Do not use emojis or overly conversational language.
+
+By following these steps, you will deliver a final, working product that meets all of the user's requirements.
