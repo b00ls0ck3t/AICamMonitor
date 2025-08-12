@@ -53,3 +53,6 @@ temp/
 *.swp
 *.swo
 *~
+calibrate_zone.py
+zone_config.json
+BabyCaptures/

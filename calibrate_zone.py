@@ -39,8 +39,34 @@ VERSION_ID = get_version_id()
 load_dotenv("config.env")
 RTSP_URL = os.getenv("RTSP_FEED_URL")
 CAM_USERNAME = os.getenv("CAM_USERNAME") 
-CAM_PASSWORD = os.getenv("CAM_PASSWORD")
 ZONE_CONFIG_FILE = "zone_config.json"
+KEYCHAIN_SERVICE = "AICamMonitor"
+
+def get_password_from_keychain(username):
+    """Retrieve password from macOS Keychain"""
+    try:
+        result = subprocess.run([
+            'security', 'find-generic-password', 
+            '-s', KEYCHAIN_SERVICE,
+            '-a', username,
+            '-w'  # Output only the password
+        ], capture_output=True, text=True, check=True)
+        
+        password = result.stdout.strip()
+        if password:
+            log_message(f"Successfully retrieved password from Keychain for user: {username}")
+            return password
+        else:
+            log_message(f"Empty password retrieved from Keychain for user: {username}")
+            return None
+            
+    except subprocess.CalledProcessError as e:
+        log_message(f"Error retrieving password from Keychain: {e}")
+        log_message("Make sure you've run ./install.sh to set up the password")
+        return None
+    except Exception as e:
+        log_message(f"Unexpected error accessing Keychain: {e}")
+        return None
 
 # Global state
 points = []
@@ -177,8 +203,15 @@ def main():
     log_message("Safe Zone Calibration Tool starting...")
     
     # Validate configuration
-    if not all([RTSP_URL, CAM_USERNAME, CAM_PASSWORD]):
-        log_message("Error: Missing camera configuration in config.env")
+    if not all([RTSP_URL, CAM_USERNAME]):
+        log_message("Error: Missing RTSP_FEED_URL or CAM_USERNAME in config.env")
+        return 1
+    
+    # Get password from Keychain
+    password = get_password_from_keychain(CAM_USERNAME)
+    if not password:
+        log_message("Error: Could not retrieve camera password from Keychain")
+        log_message("Run ./install.sh to set up the camera password")
         return 1
     
     # Check for existing zone
@@ -192,7 +225,7 @@ def main():
             log_message("Editing existing zone")
     
     # Connect to camera
-    auth_url = RTSP_URL.replace("rtsp://", f"rtsp://{CAM_USERNAME}:{CAM_PASSWORD}@")
+    auth_url = RTSP_URL.replace("rtsp://", f"rtsp://{CAM_USERNAME}:{password}@")
     log_message("Connecting to camera stream...")
     
     cap = cv2.VideoCapture(auth_url)
