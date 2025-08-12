@@ -294,3 +294,97 @@ It then starts the Swift client in the foreground.
 A trap is set to ensure that when the user presses Ctrl+C, both the background Python process and the socket file are cleaned up gracefully.
 
 This new design is fundamentally more stable, performant, and directly addresses the core problems and valid concerns raised during the previous development cycles.
+
+/////////////////////////////////////////
+
+
+DEV_NOTES Addendum: Pivot to Smart Baby Monitor
+
+Date: 2025-08-12
+
+Author: AI Assistant
+
+Context: The user has validated the core frame-grabbing and object-detection pipeline. The project is now pivoting from a general-purpose security monitor to a specialized, high-value "Smart Baby Monitor." This requires a shift from simple object detection to contextual behavioral analysis.
+
+1. New High-Level Goal: Behavioral Analysis
+
+The primary objective is no longer just to detect a "person" but to understand the context of the baby's movement. The system must be able to differentiate between normal sleep movements and events that are a cause for concern, such as moving to the edge of the bed.
+
+2. Core Technical Requirement: Zone-Based Monitoring
+
+To achieve the new goal, a "safe zone" monitoring system will be implemented.
+
+Mechanism: A user-defined polygon will be overlaid on the camera feed to designate the safe area (e.g., the center of the crib).
+
+Implementation Plan:
+
+Calibration Script (calibrate_zone.py): A new, one-time utility script will be created. It will:
+
+Display a frame from the camera feed.
+
+Allow the user to click points to define the vertices of the safe zone polygon.
+
+Save the polygon coordinates to a new configuration file (e.g., zone_config.json).
+
+Analysis in frame_grabber.py: The main frame grabber will be updated to:
+
+Load the zone_config.json at startup.
+
+For every frame where a "person" is detected, calculate the center point of the bounding box.
+
+Use OpenCV's pointPolygonTest function to determine if the baby's center point is inside, on the edge of, or outside the safe zone.
+
+3. New Event-Driven IPC Protocol
+
+The current IPC mechanism (sending raw JPEG frames) is insufficient. It will be replaced with a structured, event-driven protocol using JSON. The Python script will be the primary event producer.
+
+Proposed Event Types:
+
+{"event": "status", "state": "monitoring"}: A regular heartbeat message.
+
+{"event": "high_movement", "confidence": 0.85}: Triggered when the baby's bounding box moves significantly within the safe zone.
+
+{"event": "danger_zone_breach", "position": [x, y]}: A high-priority alert triggered when the baby's center point moves outside the safe zone.
+
+{"event": "snapshot_request"}: The Swift app can request a frame for saving a snapshot.
+
+Architectural Impact:
+
+Python (frame_grabber.py): Becomes the "brain." It performs all AI detection and zone analysis, then publishes classified events.
+
+Swift (main.swift): Becomes the "alerter." It listens for JSON events from the Python script and acts upon them (e.g., by sending a push notification).
+
+4. Remote Notifications via APNs
+
+To meet the requirement of alerting two iPhones, Apple's Push Notification service (APNs) is the designated solution.
+
+Implementation Plan:
+
+Companion iOS App: A minimal iOS application is required. Its sole purpose is to:
+
+Request permission for notifications.
+
+Register with the APNs server to get a unique device token.
+
+Securely send this token to the Mac monitor (e.g., via a one-time QR code scan or local network broadcast).
+
+Update main.swift: The Swift application on the Mac will be responsible for:
+
+Securely storing the device tokens for the two iPhones.
+
+When it receives a critical event from the Python script (like danger_zone_breach), it will construct and send a push notification payload to Apple's APNs servers.
+
+5. Future Capability: Audio Analysis
+
+Concept: The RTSP feed's audio stream can be processed to detect crying.
+
+Implementation:
+
+Modify frame_grabber.py to use ffmpeg or a similar library to capture the audio stream in parallel with the video.
+
+Perform real-time audio analysis (e.g., volume thresholding for spikes, or a more advanced sound classification model).
+
+Introduce a new IPC event type: {"event": "crying_detected"}.
+
+This addendum outlines a clear path to transform the existing application into the desired smart monitoring solution. The core architecture remains sound, with the primary changes focused on adding intelligence to the Python script and notification capabilities to the Swift app.
+
