@@ -220,3 +220,77 @@ ffmpeg -rtsp_transport tcp -i rtsp://... -vcodec rawvideo -pix_fmt bgr24 -an -r 
 - Change the CoreML loading approach (it works perfectly)
 
 The foundation is excellent - this is purely a stream protocol/format issue.
+
+
+///////////////////////////////////
+
+DEV_NOTES Update: Architectural Pivot to IPC
+Problem Statement & User Feedback
+
+The previous development cycle involved multiple attempts to create a stable video capture pipeline within a single Swift application by controlling an ffmpeg subprocess. This approach proved fragile and led to a frustrating loop where the application would hang, waiting for a video stream that never initialized correctly. The user correctly identified this as "going in circles" and suggested a fundamental architectural change.
+
+Core Decision: Decoupling and Inter-Process Communication (IPC)
+
+Based on the user's valid feedback and concerns, the core architecture was completely redesigned around two key principles:
+
+Decoupling: The single monolithic application has been split into two distinct, specialized processes:
+
+A Python Frame Grabber (frame_grabber.py): Its sole responsibility is to handle the complex and often finicky task of connecting to the RTSP stream and capturing frames. Python with OpenCV is the industry standard for this and is extremely robust.
+
+A Swift AI Processor (main.swift): Its sole responsibility is to perform what it does best: efficiently run the Core ML model on Apple hardware.
+
+Inter-Process Communication (IPC): The user expressed valid concerns about using the file system for passing frames due to performance and potential SSD wear. This led to an evaluation of in-memory IPC mechanisms.
+
+Evaluating IPC Options
+
+File-Based (Rejected): Simple to implement but introduces disk I/O latency and unnecessary SSD wear, as correctly pointed out by the user.
+
+TCP Sockets (Considered): A viable option, but it introduces the overhead of the entire network stack (TCP/IP headers, checksums, etc.), which is unnecessary for two processes communicating on the same machine.
+
+Unix Domain Sockets (UDS) (Selected): This was chosen as the optimal solution. UDS is a specialized IPC mechanism that operates entirely within the OS kernel, bypassing the network stack. It is the highest-performance method for local inter-process communication, offering a direct memory-to-memory style data transfer with minimal overhead.
+
+Final Architecture
+
+The new, robust architecture is as follows:
+
+frame_grabber.py (UDS Server):
+
+Creates a Unix Domain Socket at /tmp/aicam.sock.
+
+Waits for the Swift client to connect.
+
+Uses cv2.VideoCapture to connect to the RTSP stream.
+
+In a loop, it reads a frame, encodes it to JPEG, and sends it over the socket.
+
+main.swift (UDS Client):
+
+Connects to the /tmp/aicam.sock.
+
+Enters a loop to listen for data from the server.
+
+Reads the incoming JPEG data from the socket.
+
+Passes the in-memory JPEG data to the AIModelManager for processing.
+
+Communication Protocol:
+
+To ensure the client knows the size of each incoming frame, a simple protocol is used:
+
+The Python server first sends a 4-byte header containing the size of the upcoming JPEG data.
+
+The server then sends the complete binary data for the JPEG.
+
+The Swift client reads this header first, determines the expected size, and then reads exactly that many bytes from the socket to reconstruct the complete image.
+
+run_test.sh (Process Manager):
+
+The script now correctly manages the lifecycle of both processes.
+
+It starts the Python server in the background.
+
+It then starts the Swift client in the foreground.
+
+A trap is set to ensure that when the user presses Ctrl+C, both the background Python process and the socket file are cleaned up gracefully.
+
+This new design is fundamentally more stable, performant, and directly addresses the core problems and valid concerns raised during the previous development cycles.
