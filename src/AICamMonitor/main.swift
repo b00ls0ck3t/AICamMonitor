@@ -24,9 +24,9 @@ struct AppConfig {
     init?() {
         Logger.log("Loading configuration...")
         let configPath = FileManager.default.currentDirectoryPath + "/config.env"
-        guard let configContents = try? String(contentsOfFile: configPath) else { 
+        guard let configContents = try? String(contentsOfFile: configPath) else {
             Logger.log("Error: config.env not found")
-            return nil 
+            return nil
         }
         
         var configDict = [String: String]()
@@ -92,6 +92,8 @@ class AIModelManager {
             completion(detections)
         }
         
+        request.imageCropAndScaleOption = .scaleFill
+        
         do {
             try VNImageRequestHandler(cvPixelBuffer: buffer, options: [:]).perform([request])
         } catch {
@@ -142,6 +144,8 @@ class FrameProcessor {
             }
             
             if !filtered.isEmpty {
+                // Dispatch to main thread for handling detections to ensure thread safety
+                // with lastSnapshotTime and other shared resources.
                 DispatchQueue.main.async {
                     self.handleDetection(detections: filtered, frame: pixelBuffer, originalData: data)
                 }
@@ -278,8 +282,11 @@ class SocketManager {
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
+
+        // Calculate the size *before* the closure to avoid the compiler error.
+        let sunPathSize = MemoryLayout.size(ofValue: addr.sun_path)
         _ = withUnsafeMutablePointer(to: &addr.sun_path.0) { ptr in
-            strncpy(ptr, socketPath, Int(MemoryLayout.size(ofValue: addr.sun_path)))
+            strncpy(ptr, socketPath, sunPathSize)
         }
 
         let status = withUnsafePointer(to: &addr) {
@@ -319,8 +326,8 @@ class SocketManager {
             return nil
         }
         
-        // Convert from little-endian if needed
-        let frameSize = Int(sizeBuffer.littleEndian)
+        // Convert from little-endian to host byte order
+        let frameSize = Int(UInt32(littleEndian: sizeBuffer))
         
         // Sanity check frame size
         guard frameSize > 0 && frameSize < 10_000_000 else { // Max 10MB frame
@@ -368,7 +375,7 @@ class Application {
     private let config: AppConfig
     private let frameProcessor: FrameProcessor
     private let socketManager: SocketManager
-    private var isRunning = false
+    private var isRunning = true // Start as true
 
     init?() {
         Logger.log("Initializing AI Cam Monitor application...")
@@ -400,12 +407,17 @@ class Application {
 
     func run() {
         Logger.log("AI Cam Monitor starting up...")
-        isRunning = true
         
-        // Set up signal handling
-        signal(SIGINT) { _ in
-            Logger.log("Received interrupt signal, shutting down...")
-            exit(0)
+        // Set up signal handling for graceful shutdown
+        // ** FIX for compiler error **
+        // Use the correct global C constants for signals (SIGINT, SIGTERM)
+        SignalSource.trap(signal: SIGINT) { [weak self] _ in
+            Logger.log("Received interrupt signal (Ctrl+C), shutting down...")
+            self?.stop()
+        }
+        SignalSource.trap(signal: SIGTERM) { [weak self] _ in
+            Logger.log("Received terminate signal, shutting down...")
+            self?.stop()
         }
         
         // Start the main processing loop on a background thread
@@ -421,15 +433,18 @@ class Application {
         while isRunning {
             // Try to connect
             guard socketManager.connect() else {
+                if !isRunning { break }
                 Logger.log("Failed to connect, retrying in 5 seconds...")
                 sleep(5)
                 continue
             }
             
-            // Process frames
+            // Process frames while connected
             while isRunning {
                 guard let frameData = socketManager.readFrameData() else {
-                    Logger.log("Lost connection to server, attempting reconnection...")
+                    if isRunning {
+                       Logger.log("Lost connection to server, attempting reconnection...")
+                    }
                     break
                 }
                 
@@ -442,13 +457,34 @@ class Application {
                 sleep(2)
             }
         }
+        Logger.log("Processing loop has terminated.")
+        // Exit the application cleanly once the loop is done
+        exit(0)
     }
     
     func stop() {
+        Logger.log("Stopping application...")
         isRunning = false
         socketManager.disconnect()
+        // Give a moment for the loop to exit before the runloop stops
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+             exit(0)
+        }
     }
 }
+
+/// Helper class to trap Unix signals for graceful shutdown
+public enum SignalSource {
+    private static var sources: [DispatchSourceSignal] = []
+    
+    public static func trap(signal: Int32, handler: @escaping (Int32) -> Void) {
+        let source = DispatchSource.makeSignalSource(signal: signal, queue: .main)
+        source.setEventHandler { handler(signal) }
+        source.resume()
+        sources.append(source)
+    }
+}
+
 
 // --- Entry Point ---
 Logger.log("Starting AI Cam Monitor...")
@@ -460,7 +496,7 @@ guard let app = Application() else {
 
 // Set up cleanup on exit
 atexit {
-    Logger.log("Application shutting down...")
+    Logger.log("Application shutting down via atexit.")
 }
 
 app.run()

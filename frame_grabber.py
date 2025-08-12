@@ -1,51 +1,4 @@
-def create_rtsp_connection():
-    """Create connection to RTSP stream with retries"""
-    auth_url = RTSP_URL.replace("rtsp://", f"rtsp://{CAM_USERNAME}:{CAM_PASSWORD}@")
-    masked_url = RTSP_URL.split('@')[1] if '@' in RTSP_URL else RTSP_URL
-    log_message(f"Connecting to stream: {masked_url}")
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            cap = cv2.VideoCapture(auth_url)
-            
-            # Configure capture properties for better performance
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to get latest frames
-            cap.set(cv2.CAP_PROP_FPS, FRAME_RATE)
-            
-            if cap.isOpened():
-                # Test if we can actually read a frame
-                ret, test_frame = cap.read()
-                if ret and test_frame is not None:
-                    log_message(f"Successfully connected to stream (attempt {attempt + 1})")
-                    return cap
-                else:
-                    log_message(f"Connected but cannot read frames (attempt {attempt + 1})")
-                    cap.release()
-            else:
-                log_message(f"Could not open stream (attempt {attempt + 1})")
-                
-        except Exception as e:
-            log_message(f"Exception connecting to stream (attempt {attempt + 1}): {e}")
-        
-        if attempt < max_retries - 1:
-            log_message(f"Retrying connection in 3 seconds...")
-            time.sleep(3)
-    
-    return None
-
-def send_frame_data(frame_data):
-    """Send frame data to Swift client with error handling"""
-    try:
-        # Send size header (little-endian)
-        size_bytes = struct.pack('<I', len(frame_data))
-        client_connection.sendall(size_bytes)
-        
-        # Send frame data
-        client_connection.sendall(frame_data)
-        return True
-        
-    except (BrokenPipeError, ConnectionResetError, socket.timeout):#!/usr/bin/env python3
+#!/usr/bin/env python3
 import cv2
 import os
 import time
@@ -172,7 +125,8 @@ def wait_for_client():
 def create_rtsp_connection():
     """Create connection to RTSP stream with retries"""
     auth_url = RTSP_URL.replace("rtsp://", f"rtsp://{CAM_USERNAME}:{CAM_PASSWORD}@")
-    print(f"[Python] Connecting to stream: {RTSP_URL.split('@')[1] if '@' in RTSP_URL else RTSP_URL}")
+    masked_url = RTSP_URL.split('@')[1] if '@' in RTSP_URL else RTSP_URL
+    log_message(f"Connecting to stream: {masked_url}")
     
     max_retries = 3
     for attempt in range(max_retries):
@@ -187,19 +141,19 @@ def create_rtsp_connection():
                 # Test if we can actually read a frame
                 ret, test_frame = cap.read()
                 if ret and test_frame is not None:
-                    print(f"[Python] Successfully connected to stream (attempt {attempt + 1})")
+                    log_message(f"Successfully connected to stream (attempt {attempt + 1})")
                     return cap
                 else:
-                    print(f"[Python] Connected but cannot read frames (attempt {attempt + 1})")
+                    log_message(f"Connected but cannot read frames (attempt {attempt + 1})")
                     cap.release()
             else:
-                print(f"[Python] Could not open stream (attempt {attempt + 1})")
+                log_message(f"Could not open stream (attempt {attempt + 1})")
                 
         except Exception as e:
-            print(f"[Python] Exception connecting to stream (attempt {attempt + 1}): {e}")
+            log_message(f"Exception connecting to stream (attempt {attempt + 1}): {e}")
         
         if attempt < max_retries - 1:
-            print(f"[Python] Retrying connection in 3 seconds...")
+            log_message(f"Retrying connection in 3 seconds...")
             time.sleep(3)
     
     return None
@@ -216,10 +170,10 @@ def send_frame_data(frame_data):
         return True
         
     except (BrokenPipeError, ConnectionResetError, socket.timeout):
-        print("[Python] Swift client disconnected")
+        log_message("Swift client disconnected")
         return False
     except Exception as e:
-        print(f"[Python] Error sending frame: {e}")
+        log_message(f"Error sending frame: {e}")
         return False
 
 def capture_and_send_loop():
@@ -237,7 +191,7 @@ def capture_and_send_loop():
         if not capture:
             capture = create_rtsp_connection()
             if not capture:
-                print("[Python] Failed to connect to RTSP stream, retrying in 10 seconds...")
+                log_message("Failed to connect to RTSP stream, retrying in 10 seconds...")
                 time.sleep(10)
                 continue
             connection_failures = 0
@@ -246,10 +200,10 @@ def capture_and_send_loop():
             ret, frame = capture.read()
             if not ret or frame is None:
                 connection_failures += 1
-                print(f"[Python] Failed to read frame (failure #{connection_failures})")
+                log_message(f"Failed to read frame (failure #{connection_failures})")
                 
                 if connection_failures >= max_connection_failures:
-                    print("[Python] Too many connection failures, recreating connection...")
+                    log_message("Too many connection failures, recreating connection...")
                     capture.release()
                     capture = None
                     time.sleep(5)
@@ -274,20 +228,20 @@ def capture_and_send_loop():
             ret, jpeg_data = cv2.imencode('.jpg', frame, encode_params)
             
             if not ret or jpeg_data is None:
-                print("[Python] Error encoding frame to JPEG")
+                log_message("Error encoding frame to JPEG")
                 continue
             
             # Send to Swift client
             if not send_frame_data(jpeg_data):
-                print("[Python] Client disconnected, waiting for reconnection...")
+                log_message("Client disconnected, waiting for reconnection...")
                 break
             
             # Log progress every 50 frames
             if frame_count % 50 == 0:
-                print(f"[Python] Sent frame #{frame_count} ({len(jpeg_data)} bytes)")
+                log_message(f"Sent frame #{frame_count} ({len(jpeg_data)} bytes)")
                 
         except Exception as e:
-            print(f"[Python] Unexpected error in capture loop: {e}")
+            log_message(f"Unexpected error in capture loop: {e}")
             time.sleep(1)
     
     # Cleanup capture
@@ -299,7 +253,7 @@ def main():
     """Main function"""
     global running
     
-    print("[Python] Frame Grabber Server starting...")
+    log_message("Frame Grabber Server starting...")
     
     # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)
@@ -332,15 +286,16 @@ def main():
                 client_connection = None
             
             if running:
-                print("[Python] Waiting for next client connection...")
+                log_message("Waiting for next client connection...")
         
         return 0
         
     except KeyboardInterrupt:
-        print("\n[Python] Interrupted by user")
+        print("\n")
+        log_message("Interrupted by user")
         return 0
     except Exception as e:
-        print(f"[Python] Fatal error: {e}")
+        log_message(f"Fatal error: {e}")
         return 1
     finally:
         cleanup()
