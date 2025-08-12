@@ -609,3 +609,626 @@ FRAME_RATE=2
 - [ ] Pose estimation for safety monitoring (face-down detection)
 
 The system is now at a production-ready state for basic zone monitoring and represents a significant improvement in baby safety monitoring capabilities compared to traditional "motion detection" approaches.
+
+
+
+/////////////////////////////////////////////////
+
+
+### 9. Growth & Development Tracking 📏 **LONG-TERM VALUE**
+**Parent Value**: Track physical development over# DEV_NOTES: AICamMonitor Comprehensive Improvement Plan
+
+**Date:** 2025-08-12  
+**Status:** Production-Ready Core System → Enhancement Phase  
+**Architecture:** Python Frame Grabber + Swift AI Processor (UDS IPC)
+
+---
+
+## Current System Status ✅
+
+### What's Working Perfectly
+- **Core Pipeline**: Python OpenCV → UDS Socket → Swift CoreML → Zone Analysis
+- **Security**: Keychain password management, no plaintext credentials
+- **Zone Monitoring**: Point-in-polygon detection with normalized coordinates
+- **Alert System**: Multi-channel (system notifications + iMessage) with cooldown
+- **Build System**: Clean Swift Package Manager setup, automated model compilation
+- **Development Workflow**: `./install.sh` → `./calibrate_zone.py` → `./run_test.sh`
+
+### Architecture Strengths
+- **Decoupled Design**: Separate processes prevent single points of failure
+- **Performance**: UDS provides optimal local IPC performance
+- **Apple Integration**: Native CoreML, Vision framework, Keychain services
+- **Clean Structure**: Source code separated from build artifacts
+
+---
+
+# AICamMonitor Enhancement Roadmap
+
+## TIER 1: High-Impact Improvements (Immediate Value)
+
+### 1. Audio Crying Detection 🎯 **HIGHEST PARENT VALUE**
+**Current Gap**: Only visual monitoring, missing crying detection
+**Business Impact**: Detects distress even when baby isn't moving visually
+
+**Technical Implementation**:
+```python
+# Extend frame_grabber.py with concurrent audio processing
+import librosa
+import numpy as np
+import asyncio
+from threading import Thread
+import queue
+
+class AudioAnalyzer:
+    def __init__(self):
+        self.audio_queue = queue.Queue(maxsize=10)
+        self.crying_threshold = 0.7
+        
+    def detect_crying(self, audio_buffer, sample_rate=16000):
+        # Baby cry frequency analysis (300-600 Hz fundamental, 1200-1800 Hz harmonics)
+        fft = np.fft.fft(audio_buffer)
+        freqs = np.fft.fftfreq(len(fft), 1/sample_rate)
+        
+        # Primary crying frequency range
+        fundamental_range = (300, 600)
+        harmonic_range = (1200, 1800)
+        
+        fundamental_energy = np.sum(np.abs(fft[(freqs >= fundamental_range[0]) & (freqs <= fundamental_range[1])]))
+        harmonic_energy = np.sum(np.abs(fft[(freqs >= harmonic_range[0]) & (freqs <= harmonic_range[1])]))
+        
+        # Crying typically has strong harmonics
+        cry_signature = (fundamental_energy + harmonic_energy * 0.5) / len(audio_buffer)
+        
+        return cry_signature > self.crying_threshold
+
+# Integration into existing frame_grabber.py
+async def audio_capture_loop():
+    audio_analyzer = AudioAnalyzer()
+    # Capture audio from RTSP stream using ffmpeg subprocess
+    # Process in chunks, send crying events via UDS
+```
+
+**IPC Protocol Extension**:
+- New event type: `{"event": "crying_detected", "intensity": 0.85, "duration": 12.3, "confidence": 0.92}`
+- Swift side handles crying alerts with higher priority than movement alerts
+
+### 2. Pose Estimation Safety Monitoring 🚨 **CRITICAL SAFETY**
+**Current Gap**: Only detects presence, not dangerous positions
+**Safety Impact**: Early detection of SIDS risk factors (face-down sleeping)
+
+**Technical Implementation**:
+```swift
+// Add to AIModelManager.swift (new file)
+import Vision
+
+class PoseAnalyzer {
+    func analyzeSafetyPose(on buffer: CVImageBuffer) -> SafetyAlert? {
+        let poseRequest = VNDetectHumanBodyPoseRequest()
+        
+        try? VNImageRequestHandler(cvPixelBuffer: buffer).perform([poseRequest])
+        
+        guard let observation = poseRequest.results?.first else { return nil }
+        
+        // Check for face-down position
+        if let head = try? observation.recognizedPoint(.head),
+           let torso = try? observation.recognizedPoint(.root),
+           head.confidence > 0.5 && torso.confidence > 0.5 {
+            
+            // Analyze relative positions to determine if face-down
+            if isFaceDownPosition(head: head, torso: torso) {
+                return SafetyAlert(type: .faceDown, confidence: head.confidence, urgency: .critical)
+            }
+        }
+        
+        return nil
+    }
+    
+    private func isFaceDownPosition(head: VNRecognizedPoint, torso: VNRecognizedPoint) -> Bool {
+        // Implementation: analyze head-torso relationship for face-down detection
+        // This requires careful calibration based on camera angle
+        return false // Placeholder
+    }
+}
+```
+
+**Alert Integration**:
+- **CRITICAL alerts** bypass all cooldowns and send immediately
+- Different alert sounds/vibrations for safety vs. movement alerts
+- Automatic snapshot with pose overlay for verification
+
+### 3. Movement Pattern Intelligence 📊 **SLEEP INSIGHTS**
+**Current Gap**: Binary zone detection, no temporal analysis  
+**Parent Value**: Understanding sleep quality and patterns
+
+**Technical Implementation**:
+```python
+# Add to frame_grabber.py
+class MovementAnalyzer:
+    def __init__(self):
+        self.movement_history = []
+        self.sleep_phases = []
+        self.baseline_established = False
+        
+    def analyze_movement_pattern(self, detection_data):
+        movement_event = {
+            'timestamp': time.time(),
+            'position': detection_data.get('center_point'),
+            'confidence': detection_data.get('confidence'),
+            'bounding_box_size': detection_data.get('box_area')
+        }
+        
+        self.movement_history.append(movement_event)
+        
+        # Keep only last 2 hours of data
+        cutoff_time = time.time() - (2 * 3600)
+        self.movement_history = [m for m in self.movement_history if m['timestamp'] > cutoff_time]
+        
+        # Analyze sleep quality every 10 minutes
+        if len(self.movement_history) > 10:
+            sleep_state = self.classify_sleep_state()
+            return {
+                'event': 'sleep_analysis',
+                'state': sleep_state,
+                'movements_last_hour': self.count_recent_movements(3600),
+                'restlessness_score': self.calculate_restlessness()
+            }
+        return None
+    
+    def classify_sleep_state(self, time_window_minutes=60):
+        window_seconds = time_window_minutes * 60
+        recent_movements = self.count_recent_movements(window_seconds)
+        
+        if recent_movements < 1:
+            return "deep_sleep"
+        elif recent_movements < 4:
+            return "light_sleep"
+        elif recent_movements < 8:
+            return "restless"
+        else:
+            return "very_restless"
+            
+    def calculate_restlessness(self):
+        """Calculate restlessness score (0.0 = calm, 1.0 = very restless)"""
+        if len(self.movement_history) < 5:
+            return 0.0
+            
+        # Analyze movement frequency and intensity over last hour
+        recent = [m for m in self.movement_history if m['timestamp'] > (time.time() - 3600)]
+        
+        if not recent:
+            return 0.0
+            
+        # Factor in frequency and size of movements
+        frequency_score = min(len(recent) / 10.0, 1.0)  # 10+ movements = max score
+        
+        avg_box_size = sum(m.get('bounding_box_size', 0) for m in recent) / len(recent)
+        intensity_score = min(avg_box_size / 50000, 1.0)  # Normalize based on typical baby size
+        
+        return (frequency_score * 0.7) + (intensity_score * 0.3)
+```
+
+**Smart Alert Logic**:
+```swift
+// Add to main.swift FrameProcessor
+private func shouldAlert(sleepState: String, restlessnessScore: Float) -> Bool {
+    let currentHour = Calendar.current.component(.hour, from: Date())
+    let isNightTime = currentHour >= 22 || currentHour <= 6
+    
+    // More sensitive at night, less sensitive during typical active periods
+    let sensitivityThreshold: Float = isNightTime ? 0.3 : 0.6
+    
+    return restlessnessScore > sensitivityThreshold || sleepState == "very_restless"
+}
+```
+
+### 4. iOS Companion App 📱 **PROFESSIONAL UX**
+**Current Gap**: Limited to iMessage alerts, no rich notifications  
+**User Impact**: Dedicated push notifications, live view, two-way communication
+
+**Architecture Overview**:
+```
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────────┐
+│ Mac Monitor App │◄──►│ Local Network    │◄──►│ iOS Companion App   │
+│ (Swift)         │    │ HTTP/WebSocket   │    │ (SwiftUI)           │
+└─────────────────┘    └──────────────────┘    └─────────────────────┘
+                                                          │
+                                                          ▼
+                                               ┌─────────────────────┐
+                                               │ Apple Push          │
+                                               │ Notification (APNs) │
+                                               └─────────────────────┘
+```
+
+**Implementation Plan**:
+
+1. **Mac Side HTTP Server** (add to main.swift):
+```swift
+import Network
+
+class CompanionAppServer {
+    private let port: NWEndpoint.Port = 8080
+    private var listener: NWListener?
+    private var connections: Set<NWConnection> = []
+    
+    func startServer() {
+        listener = try? NWListener(using: .tcp, on: port)
+        listener?.newConnectionHandler = { connection in
+            self.handleNewConnection(connection)
+        }
+        listener?.start(queue: .main)
+        Logger.log("📱 Companion app server started on port \(port)")
+    }
+    
+    func broadcastAlert(_ alert: AlertData) {
+        let jsonData = try? JSONEncoder().encode(alert)
+        connections.forEach { connection in
+            connection.send(content: jsonData, completion: .idempotent)
+        }
+    }
+}
+```
+
+2. **iOS App Structure**:
+```swift
+// iOS CompanionApp/ContentView.swift
+struct ContentView: View {
+    @StateObject private var monitorConnection = MonitorConnection()
+    @State private var currentAlert: AlertData?
+    
+    var body: some View {
+        NavigationView {
+            VStack {
+                StatusCardView(connectionStatus: monitorConnection.status)
+                
+                if let alert = currentAlert {
+                    AlertBannerView(alert: alert)
+                }
+                
+                LiveFeedView(feedURL: monitorConnection.feedURL)
+                
+                HistoryListView(recentEvents: monitorConnection.recentEvents)
+            }
+            .navigationTitle("Baby Monitor")
+        }
+        .onAppear {
+            monitorConnection.connect()
+            requestNotificationPermissions()
+        }
+    }
+}
+
+// Push notification registration
+func requestNotificationPermissions() {
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
+        if granted {
+            DispatchQueue.main.async {
+                UIApplication.shared.registerForRemoteNotifications()
+            }
+        }
+    }
+}
+```
+
+3. **Setup Flow**:
+- QR code generation on Mac with WiFi credentials + server port
+- iOS app scans QR code for automatic setup
+- Device token exchange for push notifications
+- Automatic discovery via Bonjour for seamless local network connection
+
+**Rich Notification Features**:
+- Embedded snapshot images in notifications
+- Action buttons: "Acknowledge", "Request Live View", "Silence for 30min"
+- Different notification sounds for different alert types
+- Notification grouping by time/type
+
+---
+
+## TIER 2: Architecture & Performance Upgrades
+### 5. Async Python Architecture 🔧 **PERFORMANCE FOUNDATION**
+**Current Limitation**: Single-threaded Python prevents concurrent audio/video processing
+**Performance Impact**: Enables simultaneous streams without frame drops
+
+**Migration Strategy**:
+```python
+# Rewrite frame_grabber.py with asyncio
+import asyncio
+import cv2
+import json
+from concurrent.futures import ThreadPoolExecutor
+
+class AsyncFrameGrabber:
+    def __init__(self):
+        self.video_queue = asyncio.Queue(maxsize=5)
+        self.audio_queue = asyncio.Queue(maxsize=5) 
+        self.client_connections = set()
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        
+    async def video_capture_loop(self):
+        """Dedicated video capture coroutine"""
+        cap = cv2.VideoCapture(self.rtsp_url)
+        while self.running:
+            ret, frame = cap.read()
+            if ret:
+                try:
+                    await self.video_queue.put(frame, timeout=0.1)
+                except asyncio.TimeoutError:
+                    # Drop frame if queue is full (maintain real-time performance)
+                    pass
+            await asyncio.sleep(1/self.frame_rate)
+    
+    async def audio_capture_loop(self):
+        """Dedicated audio capture coroutine"""
+        # Use ffmpeg subprocess for audio extraction
+        # Process audio chunks for crying detection
+        pass
+    
+    async def ai_processing_loop(self):
+        """Process video frames with AI detection"""
+        while self.running:
+            try:
+                frame = await self.video_queue.get(timeout=1.0)
+                # Run AI detection in thread pool to avoid blocking event loop
+                detection_result = await self.loop.run_in_executor(
+                    self.executor, self.process_frame_detection, frame
+                )
+                if detection_result:
+                    await self.broadcast_event(detection_result)
+            except asyncio.TimeoutError:
+                continue
+    
+    async def main(self):
+        """Main async coordinator"""
+        await asyncio.gather(
+            self.video_capture_loop(),
+            self.audio_capture_loop(), 
+            self.ai_processing_loop(),
+            self.socket_server_loop()
+        )
+```
+
+**Benefits**:
+- Concurrent audio + video processing
+- Better real-time performance under load
+- Smoother frame delivery to Swift client
+- Reduced latency for time-sensitive alerts
+
+### 6. Intelligent Stream Management 📈 **ADAPTIVE PERFORMANCE**
+**Current Issues**: Fixed frame rate, no dynamic adjustment, hardcoded resolution
+**Enhancement**: Smart resource management based on activity and system load
+
+**Adaptive Frame Rate**:
+```python
+class AdaptiveStreamManager:
+    def __init__(self):
+        self.base_frame_rate = 2.0  # From config
+        self.current_frame_rate = self.base_frame_rate
+        self.activity_score = 0.0
+        
+    def adjust_frame_rate(self, recent_detections, system_load):
+        """Dynamically adjust frame rate based on activity"""
+        # Higher FPS during active periods
+        if recent_detections > 3:  # High activity
+            target_fps = min(self.base_frame_rate * 2, 5.0)
+        elif recent_detections > 0:  # Some activity  
+            target_fps = self.base_frame_rate * 1.5
+        else:  # No activity
+            target_fps = max(self.base_frame_rate * 0.5, 0.5)
+            
+        # Factor in system performance
+        if system_load > 0.8:  # High CPU usage
+            target_fps *= 0.7
+            
+        self.current_frame_rate = target_fps
+        
+    def get_optimal_resolution(self, detection_requirements):
+        """Choose resolution based on detection needs"""
+        if detection_requirements == "high_accuracy":
+            return (1920, 1080)
+        elif detection_requirements == "standard":
+            return (1280, 720)  # Good balance of speed/accuracy
+        else:  # "power_saving"
+            return (640, 480)
+```
+
+**Camera Capability Auto-Detection**:
+```python
+def detect_camera_capabilities(rtsp_url):
+    """Probe camera for supported resolutions and frame rates"""
+    capabilities = {}
+    
+    # Use ffprobe to query camera capabilities
+    cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', rtsp_url]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode == 0:
+        stream_info = json.loads(result.stdout)
+        video_stream = next((s for s in stream_info['streams'] if s['codec_type'] == 'video'), None)
+        if video_stream:
+            capabilities = {
+                'max_width': video_stream.get('width', 1920),
+                'max_height': video_stream.get('height', 1080), 
+                'max_fps': eval(video_stream.get('r_frame_rate', '30/1')),
+                'pixel_format': video_stream.get('pix_fmt', 'yuv420p')
+            }
+    
+    return capabilities
+```
+
+---
+
+## TIER 3: Advanced Computer Vision & Safety Features
+
+### 8. Breathing Detection 💨 **ADVANCED SAFETY**
+**Medical Value**: Monitor respiratory patterns, detect breathing irregularities
+**Technical Approach**: Computer vision analysis of subtle chest movements
+
+**Implementation Strategy**:
+```swift
+// Add to AIModelManager.swift
+class BreathingAnalyzer {
+    private var previousFrame: CVImageBuffer?
+    private var motionHistory: [Float] = []
+    
+    func analyzeBreathing(currentFrame: CVImageBuffer, torsoRegion: CGRect) -> BreathingData? {
+        guard let prevFrame = previousFrame else {
+            previousFrame = currentFrame
+            return nil
+        }
+        
+        // Optical flow analysis in torso region
+        let motionVector = calculateOpticalFlow(prev: prevFrame, current: currentFrame, region: torsoRegion)
+        let breathingSignal = extractBreathingSignal(from: motionVector)
+        
+        motionHistory.append(breathingSignal)
+        if motionHistory.count > 60 { // Keep 1 minute of data at 1fps
+            motionHistory.removeFirst()
+        }
+        
+        // Analyze for breathing pattern
+        if motionHistory.count >= 30 {
+            let breathingRate = calculateBreathingRate(from: motionHistory)
+            let irregularity = detectIrregularity(from: motionHistory)
+            
+            return BreathingData(
+                rate: breathingRate,
+                irregularity: irregularity,
+                confidence: calculateConfidence(motionHistory)
+            )
+        }
+        
+        previousFrame = currentFrame
+        return nil
+    }
+    
+    private func calculateBreathingRate(from signals: [Float]) -> Float {
+        // FFT analysis to find dominant frequency in breathing range (0.2-1.0 Hz for babies)
+        // Convert to breaths per minute
+        return 0.0 // Placeholder
+    }
+}
+```
+
+**Alert Conditions**:
+- Breathing rate outside normal range (20-60 BPM for infants)
+- Breathing irregularities or apparent cessation
+- Combined with pose estimation for comprehensive safety monitoring
+
+### 8. Breathing Detection
+**Advanced Monitoring**: Analyze subtle chest movements
+- Use optical flow analysis to detect rhythmic movement
+- Alert if breathing appears irregular or stops
+- Trend breathing rate over time
+
+### 9. Growth Tracking
+**Long-term Value**: Monitor baby's size progression
+- Calibrate against known objects (crib dimensions)
+- Track height/length changes over weeks/months
+- Generate growth charts and reports
+
+## User Experience Enhancements
+
+### 10. iOS Companion App
+**Current Gap**: Limited to iMessage alerts
+**Native Push Notifications**:
+- Dedicated iOS app for real-time alerts
+- Rich notifications with embedded snapshots
+- Two-way communication (acknowledge alerts, request live view)
+- QR code setup for easy phone pairing
+
+### 11. Web Dashboard (Optional)
+**Local Network Access**:
+- Real-time camera view from any device
+- Historical data visualization
+- Sleep pattern analytics
+- Remote configuration changes
+
+### 12. Smart Home Integration
+**Ecosystem Benefits**:
+- HomeKit integration for automation triggers
+- Philips Hue integration (gentle wake lighting)
+- Smart thermostat coordination (temperature optimization)
+
+## Data & Analytics Layer
+
+### 13. SQLite Historical Database
+**Current Gap**: No data persistence
+**Implementation**:
+```swift
+class DatabaseManager {
+    private let dbPath: String
+    
+    func logEvent(_ event: MonitoringEvent) {
+        // Store detections, zone violations, sleep patterns
+    }
+    
+    func generateSleepReport(days: Int) -> SleepAnalytics {
+        // Weekly/monthly sleep quality trends
+    }
+}
+```
+
+### 14. Privacy-First Analytics
+- All data stays local (never uploaded)
+- Exportable reports for pediatrician visits
+- Trend analysis for sleep improvement
+- Pattern recognition for unusual behavior
+
+## Robustness & Production Readiness
+
+### 15. Comprehensive Error Recovery
+- **Camera Failures**: Multiple fallback strategies, notification when camera goes offline
+- **Model Failures**: Graceful degradation, automatic model reloading
+- **Disk Space**: Automatic cleanup of old snapshots, configurable retention policies
+
+### 16. Configuration Management
+- **GUI Configuration Tool**: Replace manual config.env editing
+- **Zone Management**: Edit zones without recalibration
+- **Multiple Camera Support**: Switch between different camera feeds
+- **Profile System**: Different configurations for different times/situations
+
+### 17. Testing & Validation Framework
+```bash
+# Automated testing suite
+./test_suite.sh
+  ├── test_camera_connection.py
+  ├── test_ai_model_accuracy.py  
+  ├── test_zone_detection.py
+  ├── test_alert_delivery.py
+  └── test_performance_benchmarks.py
+```
+
+## Implementation Priority
+
+### Phase 1 (Next 1-2 weeks)
+1. **Audio crying detection** - Highest parent value
+2. **Pose estimation safety alerts** - Critical safety feature
+3. **iOS companion app** - Better user experience
+
+### Phase 2 (Month 2)
+1. **Movement pattern analysis** - Sleep quality insights
+2. **Enhanced alert intelligence** - Reduce false positives
+3. **Performance optimization** - Async architecture
+
+### Phase 3 (Month 3+)
+1. **Historical analytics** - Long-term value
+2. **Smart home integration** - Ecosystem benefits
+3. **Multi-camera support** - Scalability
+
+## Technical Debt to Address
+
+### Code Organization
+- Split `main.swift` into multiple focused files (`AIModelManager.swift`, `ZoneManager.swift`, etc.)
+- Create proper Swift Package with organized modules
+- Add comprehensive unit tests for critical functions
+
+### Documentation
+- API documentation for IPC protocol
+- User manual with troubleshooting guide
+- Developer documentation for extending the system
+
+### Security Hardening
+- Encrypt IPC communication for sensitive data
+- Add certificate validation for RTSP connections
+- Implement rate limiting to prevent abuse
+
+Would you like me to dive deeper into implementing any of these specific improvements? The audio analysis and iOS companion app would provide the most immediate value for parents.
