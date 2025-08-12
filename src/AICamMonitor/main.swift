@@ -127,16 +127,33 @@ class AIModelManager {
 
     init?() {
         Logger.log("Initializing AI Model Manager...")
-        let modelURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("src/AICamMonitor/Resources/yolov8n.mlmodelc")
-        Logger.log("Looking for compiled model at: \(modelURL.path)")
-
-        guard FileManager.default.fileExists(atPath: modelURL.path) else {
-            Logger.log("Error: Compiled model 'yolov8n.mlmodelc' not found at \(modelURL.path). Please run ./install.sh")
-            return nil
+        
+        // Look for the compiled model in the Resources directory
+        guard let modelURL = Bundle.main.url(forResource: "yolov8n", withExtension: "mlmodelc") else {
+            // Fallback to direct path if Bundle approach fails
+            let fallbackURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("src/AICamMonitor/Resources/yolov8n.mlmodelc")
+            
+            Logger.log("Model not found in app bundle, trying fallback path: \(fallbackURL.path)")
+            
+            guard FileManager.default.fileExists(atPath: fallbackURL.path) else {
+                Logger.log("Error: Compiled model 'yolov8n.mlmodelc' not found. Please run ./install.sh")
+                return nil
+            }
+            
+            Logger.log("Found model file at fallback location. Loading CoreML model...")
+            do {
+                let mlModel = try MLModel(contentsOf: fallbackURL)
+                self.model = try VNCoreMLModel(for: mlModel)
+                Logger.log("AI Model loaded successfully and ready for inference.")
+                return
+            } catch {
+                Logger.log("Error: Failed to load AI model from fallback path: \(error)")
+                return nil
+            }
         }
 
-        Logger.log("Found model file. Loading CoreML model...")
+        Logger.log("Found model file in bundle. Loading CoreML model...")
         do {
             let mlModel = try MLModel(contentsOf: modelURL)
             self.model = try VNCoreMLModel(for: mlModel)
