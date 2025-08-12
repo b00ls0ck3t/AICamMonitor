@@ -5,14 +5,6 @@ import AppKit
 import Security
 import LocalAuthentication
 
-// Conditionally import native bindings if available.
-#if canImport(SwiftFFmpeg)
-import SwiftFFmpeg
-#endif
-#if canImport(FFmpegKit)
-import FFmpegKit
-#endif
-
 // --- Global Logger ---
 class Logger {
     private static let dateFormatter: ISO8601DateFormatter = {
@@ -226,30 +218,25 @@ class RTSPStreamReader {
         process = Process()
         process?.executableURL = URL(fileURLWithPath: ffmpegPath)
 
-        // Use arguments that decode to raw video so we get data on stdout
+        // Capture JPEG frames periodically instead of continuous raw video
+        let outputPath = "/tmp/aicam_frame_\(Int(Date().timeIntervalSince1970)).jpg"
         process?.arguments = [
             "-rtsp_transport", "tcp",
             "-i", rtspURL,
-            "-vcodec", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-an",
-            "-r", "1",
-            "-f", "rawvideo",
-            "-"
+            "-frames:v", "1",        // Capture just 1 frame
+            "-vf", "scale=640:480",  // Smaller resolution for testing
+            "-vcodec", "mjpeg",
+            "-q:v", "2",             // High quality JPEG
+            "-y",                    // Overwrite output
+            outputPath
         ]
 
         let stdOutPipe = Pipe()
+        let stdErrPipe = Pipe()
         process?.standardOutput = stdOutPipe
         process?.standardError = stdErrPipe
 
-        stdOutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if !data.isEmpty {
-                Logger.log("Received \(data.count) bytes from ffmpeg stdout")
-                self?.onFrameData(data)
-            }
-        }
-
+        // For JPEG capture, we check the process completion rather than stdout
         stdErrPipe.fileHandleForReading.readabilityHandler = { handle in
             if let errorString = String(data: handle.availableData, encoding: .utf8), !errorString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 let cleanError = errorString.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -275,16 +262,26 @@ class RTSPStreamReader {
         process?.terminationHandler = { [weak self] process in
             guard let self = self, !self.isRestarting else { return }
             let exitCode = process.terminationStatus
-            if exitCode != 0 {
+            
+            // Check if JPEG was created successfully
+            if exitCode == 0 {
+                if let data = try? Data(contentsOf: URL(fileURLWithPath: outputPath)) {
+                    Logger.log("SUCCESS: Captured JPEG frame (\(data.count) bytes)")
+                    self.onFrameData(data) // Process the JPEG data
+                    try? FileManager.default.removeItem(atPath: outputPath) // Clean up
+                } else {
+                    Logger.log("Warning: ffmpeg succeeded but no JPEG file found at \(outputPath)")
+                }
+            } else {
                 Logger.log("ERROR: ffmpeg process terminated with exit code \(exitCode)")
                 if exitCode == 1 {
                     Logger.log("This usually indicates a connection or authentication problem.")
                 }
             }
-            self.isRestarting = true
-            Logger.log("Stream connection lost. Attempting to reconnect in 15 seconds...")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
-                self.isRestarting = false
+            
+            // Schedule next capture in 2 seconds
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                guard !self.isRestarting else { return }
                 self.start()
             }
         }
@@ -407,20 +404,10 @@ class Application {
     private var frameCount = 0
     private var lastHeartbeat = Date()
 
-    private lazy var streamReader: StreamReaderProtocol = {
-        #if canImport(SwiftFFmpeg)
-        return SwiftFFmpegStreamReader(rtspURL: self.config.finalRTSP_URL, onFrame: { [weak self] data in
-            self?.processCapturedFrame(data)
-        })
-        #elseif canImport(FFmpegKit)
-        return FFmpegKitStreamReader(rtspURL: self.config.finalRTSP_URL, onFrame: { [weak self] data in
-            self?.processCapturedFrame(data)
-        })
-        #else
+    private lazy var streamReader: RTSPStreamReader = {
         return RTSPStreamReader(rtspURL: self.config.finalRTSP_URL, onFrameData: { [weak self] data in
             self?.processFrameData(data)
         })
-        #endif
     }()
 
     init?() {
@@ -540,46 +527,41 @@ class Application {
     }
 
     private func processFrameData(_ data: Data) {
+        // For JPEG data, decode it directly
+        guard let image = NSImage(data: data),
+              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+            Logger.log("Failed to decode JPEG frame.")
+            return
+        }
+        
         if !hasReceivedFrame {
-            Logger.log("SUCCESS: Video stream connected! Receiving frame data from camera.")
+            Logger.log("SUCCESS: Video stream connected! Receiving JPEG frames from camera.")
             Logger.log("Frame data size: \(data.count) bytes")
             hasReceivedFrame = true
         }
 
-        frameDataBuffer.append(data)
-        let frameSize = frameWidth * frameHeight * 3
-        Logger.log("Buffer size: \(frameDataBuffer.count) bytes, Frame size needed: \(frameSize) bytes")
+        frameCount += 1
+        Logger.log("Processing JPEG frame #\(frameCount) (\(cgImage.width)x\(cgImage.height))")
 
-        while frameDataBuffer.count >= frameSize {
-            let frameData = frameDataBuffer.prefix(frameSize)
-            frameDataBuffer.removeFirst(frameSize)
+        // Create pixel buffer from the JPEG
+        guard let pixelBuffer = createPixelBufferFromCGImage(cgImage) else {
+            Logger.log("Warning: Failed to create pixel buffer for frame #\(frameCount)")
+            return
+        }
 
-            frameCount += 1
-            Logger.log("Processing frame #\(frameCount)")
-
-            if frameCount <= 10 || frameCount % 100 == 0 {
-                Logger.log("Processing: Frame #\(frameCount) received and analyzed.")
+        modelManager.performDetection(on: pixelBuffer) { [weak self] detections in
+            guard let self = self else { return }
+            let filteredDetections = detections.filter {
+                ($0.label != "unknown") && ($0.confidence >= self.config.confidenceThreshold) &&
+                (self.config.targetObjects.isEmpty || self.config.targetObjects.contains($0.label))
             }
-
-            guard let frameBuffer = createPixelBuffer(from: frameData, width: frameWidth, height: frameHeight) else {
-                Logger.log("Warning: Failed to create pixel buffer for frame #\(frameCount)")
-                continue
-            }
-
-            modelManager.performDetection(on: frameBuffer) { [weak self] detections in
-                guard let self = self else { return }
-                let filteredDetections = detections.filter {
-                    ($0.label != "unknown") && ($0.confidence >= self.config.confidenceThreshold) &&
-                    (self.config.targetObjects.isEmpty || self.config.targetObjects.contains($0.label))
-                }
-                if !filteredDetections.isEmpty {
-                    self.handleDetection(detections: filteredDetections, frame: frameBuffer)
-                }
+            if !filteredDetections.isEmpty {
+                self.handleDetection(detections: filteredDetections, frame: pixelBuffer)
             }
         }
     }
 
-    // Helper for JPEG frames captured via FFmpegKit/SwiftFFmpeg
+    // Helper for JPEG frames (no longer used, but kept for reference)
     private func processCapturedFrame(_ data: Data) {
         guard let image = NSImage(data: data),
               let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
@@ -629,14 +611,37 @@ class Application {
         }
     }
 
-    private func createPixelBuffer(from data: Data, width: Int, height: Int) -> CVPixelBuffer? {
+    private func createPixelBufferFromCGImage(_ cgImage: CGImage) -> CVPixelBuffer? {
+        let width = cgImage.width
+        let height = cgImage.height
+        
         var pixelBuffer: CVPixelBuffer?
-        var mutableData = data
-        let status = mutableData.withUnsafeMutableBytes { (bytes: UnsafeMutableRawBufferPointer) -> CVReturn in
-            let options = [kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue!, kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue!] as CFDictionary
-            return CVPixelBufferCreateWithBytes(kCFAllocatorDefault, width, height, kCVPixelFormatType_24BGR, bytes.baseAddress!, width * 3, nil, nil, options, &pixelBuffer)
+        let options = [
+            kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue!,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue!
+        ] as CFDictionary
+        
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32ARGB, options, &pixelBuffer)
+        
+        guard status == kCVReturnSuccess, let buffer = pixelBuffer else {
+            return nil
         }
-        return status == kCVReturnSuccess ? pixelBuffer : nil
+        
+        CVPixelBufferLockBaseAddress(buffer, [])
+        let context = CGContext(
+            data: CVPixelBufferGetBaseAddress(buffer),
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+        )
+        
+        context?.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        CVPixelBufferUnlockBaseAddress(buffer, [])
+        
+        return buffer
     }
 
     private func saveFrameAsJPEG(pixelBuffer: CVPixelBuffer, at url: URL) {

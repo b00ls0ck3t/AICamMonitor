@@ -95,3 +95,128 @@ Handoff 2: The CoreML Command-Line Build Issue
     * Provide the corrected `main.swift` content.
     * Instruct the user to replace the existing file content and run `./run_test.sh`.
     * Once the model loads successfully (which it will), the next step is to re-integrate the full application logic (notifications, snapshots, video frame loop) into the now-working `main.swift` foundation.
+
+
+AI Handoff & Project Brief: AICamMonitor - Updated Development Notes
+
+## Project Status: STREAM CONNECTION ISSUE
+
+### What's Working ✅
+- **Build System**: Swift Package Manager builds successfully with no dependency issues
+- **AI Model**: CoreML YOLOv8 model loads correctly from `src/AICamMonitor/Resources/yolov8n.mlmodelc`
+- **Configuration**: Reads `config.env`, retrieves credentials from macOS Keychain
+- **Stream Test**: Initial ffprobe connectivity test PASSES
+- **ffmpeg Process**: External ffmpeg launches successfully and waits for data
+- **Application Architecture**: All classes initialize correctly, logging works
+
+### Current Problem ❌
+**RTSP Stream Data Reception**: ffmpeg connects to the camera but receives no video data. The process runs but no bytes come through stdout.
+
+## Development History & Key Fixes
+
+### Phase 1: Initial Build Issues (Resolved)
+- **Problem**: Swift Package Manager syntax errors (`exclude` before `resources`)
+- **Solution**: Corrected parameter order in Package.swift
+
+### Phase 2: Dependency Hell (Resolved) 
+- **Problem**: SwiftFFmpeg couldn't find libavutil headers, FFmpegKit repository didn't exist
+- **Root Cause**: Complex native FFmpeg bindings are problematic on macOS with Homebrew
+- **Solution**: Removed ALL external dependencies, using pure Swift + external ffmpeg binary
+
+### Phase 3: Resource Conflicts (Resolved)
+- **Problem**: "multiple resources named 'coremldata.bin'" - CoreML model bundle has multiple internal files
+- **Root Cause**: Swift Package Manager treats all files in Resources as individual resources
+- **Solution**: Excluded Resources from Package.swift, load model directly via file path
+
+### Phase 4: CoreML Loading (Resolved)
+- **Problem**: "cannot find type 'yolov8n' in scope"
+- **Root Cause**: Command-line `swift build` doesn't auto-generate CoreML classes like Xcode
+- **Solution**: Use generic `MLModel(contentsOf:)` API instead of auto-generated classes
+
+### Phase 5: Current Issue - Stream Data Flow
+- **Problem**: ffmpeg connects but receives no video frames
+- **Evidence**: 
+  - ffprobe test passes (camera is reachable)
+  - ffmpeg process starts successfully
+  - No error messages from ffmpeg stderr
+  - No data received on stdout (confirmed by lack of `processFrameData` calls)
+
+## Technical Architecture (Final)
+
+### Clean Project Structure
+```
+.
+├── .gitignore               # Excludes build artifacts, models, logs
+├── readme.md               # User documentation
+├── install.sh              # One-time setup (dependencies + AI model)
+├── run_monitor.sh          # Production runner with logging
+├── run_test.sh             # Development runner 
+├── config.env              # User configuration (not in git)
+├── Package.swift           # Minimal, dependency-free
+└── src/AICamMonitor/
+    ├── main.swift          # Complete application
+    └── Resources/
+        └── yolov8n.mlmodelc/  # Compiled AI model (excluded from Package.swift)
+```
+
+### Key Design Decisions
+1. **No Native Dependencies**: Pure Swift + external binaries (ffmpeg via install.sh)
+2. **External Model Loading**: Direct file path loading avoids Swift PM resource conflicts  
+3. **Keychain Integration**: Secure credential storage, no passwords in config files
+4. **Process-Based Video**: ffmpeg subprocess handles RTSP complexity
+
+## Stream Debugging - Next Steps
+
+### Hypothesis: ffmpeg Arguments Issue
+The current ffmpeg command may not be optimal for this camera:
+```bash
+ffmpeg -rtsp_transport tcp -i rtsp://... -vcodec rawvideo -pix_fmt bgr24 -an -r 1 -f rawvideo -
+```
+
+### Debugging Strategy
+1. **Test Direct ffmpeg**: Run the exact command manually to see output
+2. **Try Alternative Formats**: JPEG snapshots instead of raw video
+3. **Check Camera Compatibility**: Some cameras need specific protocols/formats
+4. **Increase Verbosity**: Add ffmpeg debugging flags
+
+### Camera Details (Known Working)
+- **Model**: Reolink camera
+- **URL Format**: `rtsp://automation:password@10.0.60.130:554/h264Preview_01_main`
+- **Connectivity**: ffprobe confirms camera is accessible
+- **Authentication**: Keychain credentials work correctly
+
+## Code Quality Notes
+
+### Strengths
+- **Clean Architecture**: Well-separated concerns (Config, AI, Stream, Logger)
+- **Error Handling**: Comprehensive logging and graceful failure handling
+- **Security**: Keychain integration, no hardcoded credentials
+- **Resource Management**: Proper cleanup, memory management
+
+### Technical Debt
+- **Stream Format Assumption**: Hardcoded frame dimensions (1920x1080)
+- **Single Stream Strategy**: Only external ffmpeg, no fallbacks
+- **Limited Camera Support**: May need format negotiation for different cameras
+
+## Development Workflow (Current)
+1. **Setup**: `./install.sh` (one time)
+2. **Development Loop**: Edit `main.swift` → `./run_test.sh`
+3. **Production**: `./run_monitor.sh` (with logging)
+4. **Debug Stream**: Manual ffmpeg testing
+
+## Next Developer Instructions
+
+**PRIORITY**: Fix the stream data reception issue. The application architecture is solid.
+
+**Immediate debugging steps:**
+1. Test the exact ffmpeg command manually in terminal
+2. Try alternative ffmpeg output formats (MJPEG, smaller resolution)
+3. Check if camera requires specific RTSP parameters
+4. Consider implementing frame-by-frame capture instead of continuous stream
+
+**DO NOT**: 
+- Add back complex dependencies (SwiftFFmpeg, FFmpegKit)
+- Modify the clean Package.swift structure
+- Change the CoreML loading approach (it works perfectly)
+
+The foundation is excellent - this is purely a stream protocol/format issue.
