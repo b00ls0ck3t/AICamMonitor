@@ -2,13 +2,105 @@ import Foundation
 import Vision
 import CoreML
 import AppKit
+import CoreImage
 
 // --- Global Logger ---
 class Logger {
+    private static let versionId: String = {
+        // Try to get git commit hash
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        task.arguments = ["rev-parse", "--short", "HEAD"]
+        
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = Pipe() // Suppress errors
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            
+            if task.terminationStatus == 0 {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                if let hash = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !hash.isEmpty {
+                    return hash
+                }
+            }
+        } catch {
+            // Git command failed, fall back to timestamp
+        }
+        
+        // Fallback: use timestamp-based unique ID
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        return "v\(formatter.string(from: Date()))"
+    }()
+    
     static func log(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        print("[\(timestamp)][Swift] \(message)")
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        let timestamp = formatter.string(from: Date())
+        print("[\(timestamp)][\(versionId)][Swift] \(message)")
         fflush(stdout)
+    }
+}
+
+// --- Zone Configuration ---
+struct SafeZone {
+    let points: [CGPoint]
+    let name: String
+    
+    func contains(point: CGPoint) -> Bool {
+        return isPointInPolygon(point: point, polygon: points)
+    }
+    
+    private func isPointInPolygon(point: CGPoint, polygon: [CGPoint]) -> Bool {
+        guard polygon.count >= 3 else { return false }
+        
+        var inside = false
+        var j = polygon.count - 1
+        
+        for i in 0..<polygon.count {
+            let pi = polygon[i]
+            let pj = polygon[j]
+            
+            if ((pi.y > point.y) != (pj.y > point.y)) &&
+               (point.x < (pj.x - pi.x) * (point.y - pi.y) / (pj.y - pi.y) + pi.x) {
+                inside.toggle()
+            }
+            j = i
+        }
+        
+        return inside
+    }
+}
+
+// --- Keychain Manager ---
+class KeychainManager {
+    private static let keychainService = "AICamMonitor"
+    
+    static func getPassword(for username: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: username,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        
+        guard status == errSecSuccess,
+              let passwordData = result as? Data,
+              let password = String(data: passwordData, encoding: .utf8) else {
+            Logger.log("Error: Could not retrieve password from Keychain for user: \(username)")
+            Logger.log("Make sure you've run ./install.sh to set up the password")
+            return nil
+        }
+        
+        return password
     }
 }
 
@@ -20,6 +112,11 @@ struct AppConfig {
     let snapshotOnDetection: Bool
     let notificationCooldown: TimeInterval
     let socketPath = "/tmp/aicam.sock"
+    let safeZone: SafeZone?
+    let frameWidth: Int
+    let frameHeight: Int
+    let rtspUrl: String
+    let alertRecipients: [String]
 
     init?() {
         Logger.log("Loading configuration...")
@@ -39,12 +136,59 @@ struct AppConfig {
             }
         }
         
-        self.saveDirectory = URL(fileURLWithPath: configDict["SNAPSHOT_DIRECTORY"] ?? "Captures")
-        self.targetObjects = (configDict["OBJECTS_TO_MONITOR"] ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-        self.confidenceThreshold = Float(configDict["DETECTION_THRESHOLD"] ?? "0.4") ?? 0.4
+        // Get camera credentials
+        guard let baseUrl = configDict["RTSP_FEED_URL"],
+              let username = configDict["CAM_USERNAME"],
+              let password = KeychainManager.getPassword(for: username) else {
+            Logger.log("Error: Missing camera configuration or password")
+            return nil
+        }
+        
+        // Build authenticated RTSP URL
+        self.rtspUrl = baseUrl.replacingOccurrences(of: "rtsp://", with: "rtsp://\(username):\(password)@")
+        
+        self.saveDirectory = URL(fileURLWithPath: configDict["SNAPSHOT_DIRECTORY"] ?? "BabyCaptures")
+        self.targetObjects = (configDict["OBJECTS_TO_MONITOR"] ?? "person").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        self.confidenceThreshold = Float(configDict["DETECTION_THRESHOLD"] ?? "0.3") ?? 0.3
         self.snapshotOnDetection = (configDict["SNAPSHOT_ON_DETECTION"] ?? "true").lowercased() == "true"
-        self.notificationCooldown = TimeInterval(configDict["NOTIFICATION_COOLDOWN"] ?? "10") ?? 10
-        Logger.log("Configuration loaded. Target objects: \(targetObjects.isEmpty ? "ALL" : targetObjects.joined(separator: ", "))")
+        self.notificationCooldown = TimeInterval(configDict["NOTIFICATION_COOLDOWN"] ?? "30") ?? 30
+        self.frameWidth = Int(configDict["FRAME_WIDTH"] ?? "1920") ?? 1920
+        self.frameHeight = Int(configDict["FRAME_HEIGHT"] ?? "1080") ?? 1080
+        
+        // Load alert recipients
+        self.alertRecipients = [
+            configDict["ALERT_RECIPIENT_1"],
+            configDict["ALERT_RECIPIENT_2"]
+        ].compactMap { $0 }.filter { !$0.isEmpty }
+        
+        // Load safe zone configuration
+        self.safeZone = Self.loadSafeZone()
+        
+        Logger.log("Configuration loaded. Target objects: \(targetObjects.joined(separator: ", "))")
+        Logger.log("Alert recipients: \(alertRecipients.count) configured")
+        if let zone = safeZone {
+            Logger.log("Safe zone loaded: \(zone.name) with \(zone.points.count) points")
+        } else {
+            Logger.log("⚠️  No safe zone configured - run 'python3 calibrate_zone.py' first")
+        }
+    }
+    
+    private static func loadSafeZone() -> SafeZone? {
+        let zonePath = FileManager.default.currentDirectoryPath + "/zone_config.json"
+        guard let zoneData = try? Data(contentsOf: URL(fileURLWithPath: zonePath)),
+              let json = try? JSONSerialization.jsonObject(with: zoneData) as? [String: Any],
+              let name = json["name"] as? String,
+              let pointsArray = json["points"] as? [[String: Double]] else {
+            return nil
+        }
+        
+        let points = pointsArray.compactMap { point -> CGPoint? in
+            guard let x = point["x"], let y = point["y"] else { return nil }
+            return CGPoint(x: x, y: y)
+        }
+        
+        guard points.count >= 3 else { return nil }
+        return SafeZone(points: points, name: name)
     }
 }
 
@@ -103,23 +247,89 @@ class AIModelManager {
     }
 }
 
+// --- Alert Manager ---
+class AlertManager {
+    private var lastAlertTime = Date(timeIntervalSince1970: 0)
+    private let cooldownPeriod: TimeInterval
+    private let alertRecipients: [String]
+    
+    init(cooldownPeriod: TimeInterval, alertRecipients: [String]) {
+        self.cooldownPeriod = cooldownPeriod
+        self.alertRecipients = alertRecipients
+    }
+    
+    func sendZoneAlert(position: CGPoint, frameSize: CGSize) {
+        let now = Date()
+        guard now.timeIntervalSince(lastAlertTime) >= cooldownPeriod else {
+            return // Still in cooldown
+        }
+        
+        lastAlertTime = now
+        
+        let actualX = Int(position.x * frameSize.width)
+        let actualY = Int(position.y * frameSize.height)
+        let alertMessage = "🚨 BABY ALERT: Movement detected outside safe zone at position (\(actualX), \(actualY))"
+        
+        Logger.log(alertMessage)
+        
+        // Send system notification
+        sendSystemNotification(title: "Baby Monitor Alert", message: "Baby moved outside safe zone")
+        
+        // Send iMessage alerts to configured recipients
+        for recipient in alertRecipients {
+            sendIMessageAlert(to: recipient, message: alertMessage)
+        }
+    }
+    
+    private func sendSystemNotification(title: String, message: String) {
+        let notification = NSUserNotification()
+        notification.title = title
+        notification.informativeText = message
+        notification.soundName = NSUserNotificationDefaultSoundName
+        
+        NSUserNotificationCenter.default.deliver(notification)
+    }
+    
+    private func sendIMessageAlert(to recipient: String, message: String) {
+        let scriptPath = "\(FileManager.default.currentDirectoryPath)/send_alert.scpt"
+        
+        guard FileManager.default.fileExists(atPath: scriptPath) else {
+            Logger.log("Warning: send_alert.scpt not found, skipping iMessage alert")
+            return
+        }
+        
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        task.arguments = [scriptPath, message, recipient]
+        
+        do {
+            try task.run()
+            Logger.log("📱 iMessage alert sent to \(recipient)")
+        } catch {
+            Logger.log("Error sending iMessage alert: \(error)")
+        }
+    }
+}
+
 // --- Frame Processor ---
 class FrameProcessor {
     private let config: AppConfig
     private let modelManager: AIModelManager
+    private let alertManager: AlertManager
     private var lastSnapshotTime = Date(timeIntervalSince1970: 0)
     private var frameCount = 0
 
     init(config: AppConfig, modelManager: AIModelManager) {
         self.config = config
         self.modelManager = modelManager
+        self.alertManager = AlertManager(cooldownPeriod: config.notificationCooldown, alertRecipients: config.alertRecipients)
     }
 
     func processFrame(data: Data) {
         self.frameCount += 1
         
-        // Log every 10th frame to avoid spam
-        if frameCount % 10 == 1 {
+        // Log every 20th frame to avoid spam
+        if frameCount % 20 == 1 {
             Logger.log("Processing frame #\(self.frameCount), size: \(data.count) bytes")
         }
 
@@ -144,16 +354,35 @@ class FrameProcessor {
             }
             
             if !filtered.isEmpty {
-                // Dispatch to main thread for handling detections to ensure thread safety
-                // with lastSnapshotTime and other shared resources.
                 DispatchQueue.main.async {
-                    self.handleDetection(detections: filtered, frame: pixelBuffer, originalData: data)
+                    self.handleDetection(detections: filtered, frame: pixelBuffer, originalData: data, frameSize: cgImage.size)
                 }
             }
         }
     }
     
-    private func handleDetection(detections: [(label: String, confidence: Float, box: CGRect)], frame: CVImageBuffer, originalData: Data) {
+    private func handleDetection(detections: [(label: String, confidence: Float, box: CGRect)], frame: CVImageBuffer, originalData: Data, frameSize: CGSize) {
+        
+        // Check zone violations for baby monitoring
+        if let safeZone = config.safeZone {
+            for detection in detections {
+                // Calculate center point of detection (Vision uses normalized coordinates)
+                let centerX = detection.box.midX
+                let centerY = 1.0 - detection.box.midY // Flip Y coordinate (Vision uses bottom-left origin)
+                let centerPoint = CGPoint(x: centerX, y: centerY)
+                
+                if !safeZone.contains(point: centerPoint) {
+                    Logger.log("🚨 ZONE VIOLATION: \(detection.label) detected outside safe zone at (\(Int(centerX * frameSize.width)), \(Int(centerY * frameSize.height)))")
+                    alertManager.sendZoneAlert(position: centerPoint, frameSize: frameSize)
+                    
+                    // Always save snapshot on zone violation
+                    saveSnapshot(detections: detections, frame: frame, timestamp: Date(), reason: "zone_violation")
+                    return // Don't process regular detections if we have a violation
+                }
+            }
+        }
+        
+        // Regular detection handling
         let now = Date()
         if now.timeIntervalSince(lastSnapshotTime) < config.notificationCooldown { 
             return 
@@ -161,20 +390,20 @@ class FrameProcessor {
         lastSnapshotTime = now
         
         let labels = detections.map { "\($0.label) (\(Int($0.confidence * 100))%)" }.joined(separator: ", ")
-        Logger.log("🎯 DETECTION: \(labels)")
+        Logger.log("👶 MOVEMENT: \(labels)")
 
         if config.snapshotOnDetection {
-            saveSnapshot(detections: detections, frame: frame, timestamp: now)
+            saveSnapshot(detections: detections, frame: frame, timestamp: now, reason: "movement")
         }
     }
     
-    private func saveSnapshot(detections: [(label: String, confidence: Float, box: CGRect)], frame: CVImageBuffer, timestamp: Date) {
+    private func saveSnapshot(detections: [(label: String, confidence: Float, box: CGRect)], frame: CVImageBuffer, timestamp: Date, reason: String) {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let dateString = formatter.string(from: timestamp)
         
         let primaryObject = detections.first?.label ?? "detection"
-        let fileName = "\(dateString)_\(primaryObject).jpg"
+        let fileName = "\(dateString)_\(reason)_\(primaryObject).jpg"
         let saveURL = config.saveDirectory.appendingPathComponent(fileName)
         
         if saveFrameAsJPEG(pixelBuffer: frame, at: saveURL) {
@@ -184,6 +413,8 @@ class FrameProcessor {
         }
     }
 
+    // --- Utility Functions ---
+    
     private func createPixelBufferFromCGImage(_ cgImage: CGImage) -> CVPixelBuffer? {
         let width = cgImage.width
         let height = cgImage.height
@@ -234,11 +465,16 @@ class FrameProcessor {
             return false
         }
         
-        // Set JPEG quality
         let properties: [String: Any] = [kCGImageDestinationLossyCompressionQuality as String: 0.9]
         CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
         
         return CGImageDestinationFinalize(destination)
+    }
+}
+
+extension CGImage {
+    var size: CGSize {
+        return CGSize(width: width, height: height)
     }
 }
 
@@ -261,7 +497,7 @@ class SocketManager {
         
         // Wait for the socket file to be created by the Python server
         var attempts = 0
-        while !FileManager.default.fileExists(atPath: socketPath) && attempts < 30 {
+        while !FileManager.default.fileExists(atPath: socketPath) && attempts < 60 {
             if attempts == 0 {
                 Logger.log("Waiting for Python server to create socket...")
             }
@@ -283,10 +519,9 @@ class SocketManager {
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
 
-        // Calculate the size *before* the closure to avoid the compiler error.
         let sunPathSize = MemoryLayout.size(ofValue: addr.sun_path)
         _ = withUnsafeMutablePointer(to: &addr.sun_path.0) { ptr in
-            strncpy(ptr, socketPath, sunPathSize)
+            strncpy(ptr, socketPath, sunPathSize - 1)
         }
 
         let status = withUnsafePointer(to: &addr) {
@@ -326,17 +561,14 @@ class SocketManager {
             return nil
         }
         
-        // Convert from little-endian to host byte order
         let frameSize = Int(UInt32(littleEndian: sizeBuffer))
         
-        // Sanity check frame size
-        guard frameSize > 0 && frameSize < 10_000_000 else { // Max 10MB frame
+        guard frameSize > 0 && frameSize < 10_000_000 else {
             Logger.log("Invalid frame size received: \(frameSize)")
             disconnect()
             return nil
         }
         
-        // Read the full frame data
         var frameBuffer = Data(count: frameSize)
         var totalBytesRead = 0
         
@@ -370,12 +602,42 @@ class SocketManager {
     }
 }
 
+// --- Signal Handler ---
+class SignalHandler {
+    private static var sources: [DispatchSourceSignal] = []
+    
+    static func setupSignalHandling(onSignal: @escaping () -> Void) {
+        // Block the signals so they don't terminate the process immediately
+        signal(SIGINT, SIG_IGN)
+        signal(SIGTERM, SIG_IGN)
+        
+        // Set up dispatch sources for graceful handling
+        let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        let sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        
+        sigintSource.setEventHandler {
+            Logger.log("Received SIGINT (Ctrl+C)")
+            onSignal()
+        }
+        
+        sigtermSource.setEventHandler {
+            Logger.log("Received SIGTERM")
+            onSignal()
+        }
+        
+        sigintSource.resume()
+        sigtermSource.resume()
+        
+        sources = [sigintSource, sigtermSource]
+    }
+}
+
 // --- Main Application ---
 class Application {
     private let config: AppConfig
     private let frameProcessor: FrameProcessor
     private let socketManager: SocketManager
-    private var isRunning = true // Start as true
+    private var isRunning = true
 
     init?() {
         Logger.log("Initializing AI Cam Monitor application...")
@@ -406,32 +668,24 @@ class Application {
     }
 
     func run() {
-        Logger.log("AI Cam Monitor starting up...")
+        Logger.log("👶 Baby Monitor starting up...")
         
-        // Set up signal handling for graceful shutdown
-        // ** FIX for compiler error **
-        // Use the correct global C constants for signals (SIGINT, SIGTERM)
-        SignalSource.trap(signal: SIGINT) { [weak self] _ in
-            Logger.log("Received interrupt signal (Ctrl+C), shutting down...")
-            self?.stop()
-        }
-        SignalSource.trap(signal: SIGTERM) { [weak self] _ in
-            Logger.log("Received terminate signal, shutting down...")
+        // Set up signal handling
+        SignalHandler.setupSignalHandling { [weak self] in
             self?.stop()
         }
         
-        // Start the main processing loop on a background thread
+        // Start processing on background thread
         DispatchQueue.global(qos: .userInitiated).async {
             self.processingLoop()
         }
         
-        // Keep the main thread alive
+        // Keep main thread alive
         RunLoop.main.run()
     }
     
     private func processingLoop() {
         while isRunning {
-            // Try to connect
             guard socketManager.connect() else {
                 if !isRunning { break }
                 Logger.log("Failed to connect, retrying in 5 seconds...")
@@ -439,7 +693,8 @@ class Application {
                 continue
             }
             
-            // Process frames while connected
+            Logger.log("✅ Connected to frame grabber - monitoring active")
+            
             while isRunning {
                 guard let frameData = socketManager.readFrameData() else {
                     if isRunning {
@@ -457,46 +712,26 @@ class Application {
                 sleep(2)
             }
         }
-        Logger.log("Processing loop has terminated.")
-        // Exit the application cleanly once the loop is done
-        exit(0)
+        
+        Logger.log("Processing loop terminated")
+        DispatchQueue.main.async {
+            exit(0)
+        }
     }
     
     func stop() {
-        Logger.log("Stopping application...")
+        Logger.log("Stopping baby monitor...")
         isRunning = false
         socketManager.disconnect()
-        // Give a moment for the loop to exit before the runloop stops
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-             exit(0)
-        }
     }
 }
-
-/// Helper class to trap Unix signals for graceful shutdown
-public enum SignalSource {
-    private static var sources: [DispatchSourceSignal] = []
-    
-    public static func trap(signal: Int32, handler: @escaping (Int32) -> Void) {
-        let source = DispatchSource.makeSignalSource(signal: signal, queue: .main)
-        source.setEventHandler { handler(signal) }
-        source.resume()
-        sources.append(source)
-    }
-}
-
 
 // --- Entry Point ---
-Logger.log("Starting AI Cam Monitor...")
+Logger.log("Starting Baby Monitor System...")
 
 guard let app = Application() else {
     Logger.log("FATAL: Application failed to initialize")
     exit(1)
-}
-
-// Set up cleanup on exit
-atexit {
-    Logger.log("Application shutting down via atexit.")
 }
 
 app.run()

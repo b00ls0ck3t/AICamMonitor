@@ -6,17 +6,37 @@ import sys
 import socket
 import struct
 import signal
+import subprocess
 from datetime import datetime
 from dotenv import load_dotenv
+
+# --- Get Version ID ---
+def get_version_id():
+    """Get git commit hash or fallback to timestamp"""
+    try:
+        result = subprocess.run([
+            'git', 'rev-parse', '--short', 'HEAD'
+        ], capture_output=True, text=True, check=True)
+        
+        commit_hash = result.stdout.strip()
+        if commit_hash:
+            return commit_hash
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    
+    # Fallback to timestamp-based ID
+    return f"v{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+VERSION_ID = get_version_id()
 
 # --- Configuration ---
 load_dotenv("config.env")
 
 RTSP_URL = os.getenv("RTSP_FEED_URL")
 CAM_USERNAME = os.getenv("CAM_USERNAME")
-CAM_PASSWORD = os.getenv("CAM_PASSWORD")
 FRAME_RATE = int(os.getenv("FRAME_RATE", 1))
 SOCKET_PATH = "/tmp/aicam.sock"
+KEYCHAIN_SERVICE = "AICamMonitor"
 
 # Global state for graceful shutdown
 server_socket = None
@@ -25,10 +45,36 @@ capture = None
 running = True
 
 def log_message(message):
-    """Unified logging format with timestamps"""
+    """Unified logging format with timestamps and version"""
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp}][frame_grabber.py] {message}")
+    print(f"[{timestamp}][{VERSION_ID}][frame_grabber.py] {message}")
     sys.stdout.flush()
+
+def get_password_from_keychain(username):
+    """Retrieve password from macOS Keychain"""
+    try:
+        result = subprocess.run([
+            'security', 'find-generic-password', 
+            '-s', KEYCHAIN_SERVICE,
+            '-a', username,
+            '-w'  # Output only the password
+        ], capture_output=True, text=True, check=True)
+        
+        password = result.stdout.strip()
+        if password:
+            log_message(f"Successfully retrieved password from Keychain for user: {username}")
+            return password
+        else:
+            log_message(f"Empty password retrieved from Keychain for user: {username}")
+            return None
+            
+    except subprocess.CalledProcessError as e:
+        log_message(f"Error retrieving password from Keychain: {e}")
+        log_message("Make sure you've run ./install.sh to set up the password")
+        return None
+    except Exception as e:
+        log_message(f"Unexpected error accessing Keychain: {e}")
+        return None
 
 def signal_handler(sig, frame):
     """Handle graceful shutdown on SIGINT/SIGTERM"""
@@ -67,8 +113,14 @@ def cleanup():
 
 def validate_configuration():
     """Validate that all required configuration is present"""
-    if not all([RTSP_URL, CAM_USERNAME, CAM_PASSWORD]):
-        log_message("Error: RTSP_FEED_URL, CAM_USERNAME, or CAM_PASSWORD not found in config.env")
+    if not all([RTSP_URL, CAM_USERNAME]):
+        log_message("Error: RTSP_FEED_URL or CAM_USERNAME not found in config.env")
+        return False
+    
+    # Get password from Keychain
+    password = get_password_from_keychain(CAM_USERNAME)
+    if not password:
+        log_message("Error: Could not retrieve camera password from Keychain")
         return False
     
     if FRAME_RATE < 0.1 or FRAME_RATE > 30:
@@ -104,17 +156,16 @@ def wait_for_client():
     
     log_message("Waiting for Swift client to connect...")
     try:
-        # Set a timeout to periodically check if we should shutdown
         server_socket.settimeout(1.0)
         
         while running:
             try:
                 client_connection, _ = server_socket.accept()
-                client_connection.settimeout(5.0)  # 5 second timeout for reads/writes
+                client_connection.settimeout(5.0)
                 log_message("Swift client connected")
                 return True
             except socket.timeout:
-                continue  # Check running flag and try again
+                continue
             except Exception as e:
                 log_message(f"Error accepting connection: {e}")
                 return False
@@ -124,7 +175,13 @@ def wait_for_client():
 
 def create_rtsp_connection():
     """Create connection to RTSP stream with retries"""
-    auth_url = RTSP_URL.replace("rtsp://", f"rtsp://{CAM_USERNAME}:{CAM_PASSWORD}@")
+    # Get password from Keychain
+    password = get_password_from_keychain(CAM_USERNAME)
+    if not password:
+        log_message("Error: Could not retrieve password for RTSP connection")
+        return None
+    
+    auth_url = RTSP_URL.replace("rtsp://", f"rtsp://{CAM_USERNAME}:{password}@")
     masked_url = RTSP_URL.split('@')[1] if '@' in RTSP_URL else RTSP_URL
     log_message(f"Connecting to stream: {masked_url}")
     
@@ -134,7 +191,7 @@ def create_rtsp_connection():
             cap = cv2.VideoCapture(auth_url)
             
             # Configure capture properties for better performance
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to get latest frames
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             cap.set(cv2.CAP_PROP_FPS, FRAME_RATE)
             
             if cap.isOpened():
@@ -224,7 +281,7 @@ def capture_and_send_loop():
             frame_count += 1
             
             # Encode frame as JPEG
-            encode_params = [cv2.IMWRITE_JPEG_QUALITY, 85]  # Slightly lower quality for better performance
+            encode_params = [cv2.IMWRITE_JPEG_QUALITY, 85]
             ret, jpeg_data = cv2.imencode('.jpg', frame, encode_params)
             
             if not ret or jpeg_data is None:
@@ -238,7 +295,7 @@ def capture_and_send_loop():
             
             # Log progress every 50 frames
             if frame_count % 50 == 0:
-                log_message(f"Sent frame #{frame_count} ({len(jpeg_data)} bytes)")
+                log_message(f"👶 Sent frame #{frame_count} ({len(jpeg_data)} bytes)")
                 
         except Exception as e:
             log_message(f"Unexpected error in capture loop: {e}")
@@ -253,7 +310,7 @@ def main():
     """Main function"""
     global running
     
-    log_message("Frame Grabber Server starting...")
+    log_message("👶 Baby Monitor Frame Grabber starting...")
     
     # Set up signal handlers
     signal.signal(signal.SIGINT, signal_handler)
